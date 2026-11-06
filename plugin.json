@@ -1,0 +1,12 @@
+{
+  "name": "agent-distiller",
+  "displayName": "Multi-Turn & Tool Trajectory Distiller",
+  "version": "1.0.0",
+  "description": "Automated multi-turn conversation and real tool-calling trajectory distillation workflow using isolated Main-Sub Agent orchestration and ShareGPT persistence.",
+  "logo": "assets/logo.svg",
+  "suggestedPrompts": [
+    "使用 multi-turn-tool-distiller 从 examples/seed_examples.jsonl 串行蒸馏多轮工具调用数据",
+    "并行开启 3 个 Sub-Agent 自动生成并蒸馏命令行与文件分析多轮数据集",
+    "检查 datasets/ 目录下的蒸馏断点状态并重试 failed.jsonl 中的样本"
+  ]
+}
