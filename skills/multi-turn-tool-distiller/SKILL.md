@@ -19,9 +19,9 @@ description: >-
    - 负责解析输入配置、管理任务队列与断点状态（`.state.json`）、注册并拉起 Sub-Agent、扮演多轮对话中的用户（User Simulator）发起递进追问、审计 `<think>` 与工具调用质量、在未达标时切换提示词模板重试（最多 `max_retries` 次），并调用落盘脚本写入 `.jsonl`。
    - **严禁越俎代庖**：Main-Agent 绝不能直接替 Sub-Agent 生成被蒸馏的业务回答或伪造工具执行轨迹。
 2. **Sub-Agent（单样本隔离教师实例）**：
-   - **单样本单实例 + 分支隔离**：每一条完整样本（含其内全部多轮对话与工具调用）必须对应一个独立的 Sub-Agent 实例，且统一设置 `Workspace="branch"` 克隆独立 Git 分支工作区，杜绝跨样本上下文或文件系统污染。
+   - **单样本单实例 + 工作区隔离**：每一条完整样本（含其内全部多轮对话与工具调用）必须对应一个独立的 Sub-Agent 实例。优先尝试 `Workspace="branch"` 克隆独立分支工作区；若宿主返回 `branch workspace not supported for VCS type Unknown`，则自动回退至 `Workspace="inherit"` 并为该样本分配独立沙箱子目录（如 `datasets/sandboxes/<sample_id>/`），杜绝跨样本上下文或文件系统污染。
    - **真实工具调用**：Sub-Agent 直接调用宿主内置真实工具（`read_file`、`write_file`、`edit_file`、`run_command`、`call_mcp_tool` 等）。
-   - **生命周期即用即毁**：单条样本落盘（或超过最大重试归档至 `failed.jsonl`）后，Main-Agent 必须立即调用 `manage_subagents(Action="kill", ConversationIds=[subagent_id])` 销毁该实例及其分支工作区。
+   - **生命周期即用即毁**：单条样本落盘（或超过最大重试归档至 `failed.jsonl`）后，Main-Agent 必须立即调用 `manage_subagents(Action="kill", ConversationIds=[subagent_id])` 销毁该实例。
 
 ---
 
@@ -87,7 +87,7 @@ description: >-
   - `TypeName`: `"distill_teacher_agent"`
   - `Role`: `"Teacher Agent - " + sample["sample_id"]`
   - `Model`: `"inherit"`
-  - `Workspace`: `"branch"`
+  - `Workspace`: 优先传 `"branch"`；若当前工作区 VCS 类型返回 `branch workspace not supported for VCS type Unknown`，则自动切换为 `"inherit"`（如任务涉及写入临时文件，限定在 `datasets/sandboxes/<sample_id>/` 内操作）
   - `Prompt`: 组装后的首轮任务提示词
 - **串行模式 (`serial`)**：每次仅拉起 1 个 Sub-Agent，等待其返回后再推进下一轮或下一条样本。
 - **并行模式 (`parallel`)**：在同一轮工具调用中同时发起 `batch_size` 个 `invoke_subagent` 调用，记录每个 `sample_id <-> conversationId` 映射表。停止工具调用以等待宿主 Reactive Wakeup 异步唤醒。

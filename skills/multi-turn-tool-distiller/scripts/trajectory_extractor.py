@@ -20,6 +20,19 @@ from typing import Any, Dict, List, Optional, Tuple
 
 
 BUILTIN_TOOL_SCHEMAS: Dict[str, Dict[str, Any]] = {
+    "view_file": {
+        "name": "view_file",
+        "description": "Read the contents of a text, image, pdf, video, or audio file.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "AbsolutePath": {"type": "string", "description": "The absolute path of the file to read."},
+                "StartLine": {"type": "integer", "description": "Start line to read (inclusive)."},
+                "EndLine": {"type": "integer", "description": "End line to read (inclusive)."},
+            },
+            "required": ["AbsolutePath"],
+        },
+    },
     "read_file": {
         "name": "read_file",
         "description": "Read the contents of a text, image, pdf, video, or audio file.",
@@ -87,7 +100,13 @@ BUILTIN_TOOL_SCHEMAS: Dict[str, Dict[str, Any]] = {
     },
 }
 
-THINK_PATTERN = re.compile(r"<think>\s*(.*?)\s*</think>", re.DOTALL | re.IGNORECASE)
+# Match standalone <think>...</think> blocks not enclosed in inline backticks
+THINK_BLOCK_PATTERN = re.compile(r"(?<!`)<think>\s*(.*?)\s*</think>(?!`)", re.DOTALL | re.IGNORECASE)
+LEADING_THINK_PATTERN = re.compile(r"^\s*<think>\s*(.*?)\s*</think>\s*", re.DOTALL | re.IGNORECASE)
+SYSTEM_MSG_ENVELOPE = re.compile(
+    r"<SYSTEM_MESSAGE>\s*\[Message\]\s+timestamp=\S+\s+sender=\S+\s+priority=\S+\s+content=(.*?)\s*</SYSTEM_MESSAGE>",
+    re.DOTALL,
+)
 
 REFUSAL_KEYWORDS = [
     "i cannot fulfill this request",
@@ -97,9 +116,20 @@ REFUSAL_KEYWORDS = [
 ]
 
 
+def is_parent_agent_message(step: Dict[str, Any]) -> bool:
+    """Check if a SYSTEM_MESSAGE step is an incoming prompt/follow-up from the parent agent."""
+    if step.get("type") != "SYSTEM_MESSAGE":
+        return False
+    content = str(step.get("content") or "")
+    return bool(SYSTEM_MSG_ENVELOPE.search(content))
+
+
 def clean_human_prompt(raw_content: str) -> str:
-    """Strip prompt-strategy wrapper headers/footers to recover the clean user question."""
+    """Strip SYSTEM_MESSAGE envelope and prompt-strategy wrapper headers/footers."""
     text = raw_content.strip()
+    env_match = SYSTEM_MSG_ENVELOPE.search(text)
+    if env_match:
+        text = env_match.group(1).strip()
     # Match 【用户第 X 轮提问】： or 【用户第 X 轮追问】：
     marker_match = re.search(r"【用户第\s*\d+\s*轮(?:提问|追问)】：\s*(.*)", text, re.DOTALL)
     if marker_match:
@@ -110,11 +140,21 @@ def clean_human_prompt(raw_content: str) -> str:
 
 
 def split_think_and_body(raw_text: str) -> Tuple[List[str], str]:
-    """Extract all <think>...</think> blocks and the remaining visible answer text."""
+    """Extract standalone <think>...</think> blocks and the remaining visible answer text."""
     if not raw_text:
         return [], ""
-    thinks = [m.strip() for m in THINK_PATTERN.findall(raw_text) if m.strip()]
-    body = THINK_PATTERN.sub("", raw_text).strip()
+    lead_match = LEADING_THINK_PATTERN.match(raw_text)
+    if lead_match:
+        think_content = lead_match.group(1).strip()
+        body = raw_text[lead_match.end():].strip()
+        return ([think_content] if think_content else []), body
+
+    thinks = [
+        m.strip()
+        for m in THINK_BLOCK_PATTERN.findall(raw_text)
+        if m.strip() and m.strip() != "..."
+    ]
+    body = THINK_BLOCK_PATTERN.sub("", raw_text).strip()
     return thinks, body
 
 
@@ -123,9 +163,9 @@ def synthesize_concise_pre_tool_think(tool_name: str, args: Dict[str, Any]) -> s
     Build a concise, high-level direct summary when the native planner step invokes
     a tool directly without emitting a separate inline text field in the same step.
     """
-    if tool_name == "read_file":
-        target = args.get("Path", "目标文件")
-        return f"需要读取文件 `{target}` 以获取满足当前任务所需的配置或代码内容。我将调用 `read_file` 工具传入该路径参数进行读取。"
+    if tool_name in ("read_file", "view_file"):
+        target = args.get("Path") or args.get("AbsolutePath") or "目标文件"
+        return f"需要读取文件 `{target}` 以获取满足当前任务所需的配置或代码内容。我将调用 `{tool_name}` 工具传入该路径参数进行读取。"
     if tool_name == "write_file":
         target = args.get("Path", "目标文件")
         return f"需要将处理后的内容写入文件 `{target}`。我将调用 `write_file` 工具并传入目标路径与完整文件内容。"
@@ -174,11 +214,15 @@ def parse_transcript(
         source = step.get("source", "")
 
         # Detect user or parent-agent follow-up input
-        is_user_turn = stype == "USER_INPUT" or (
-            stype == "GENERIC"
-            and source in ("USER_EXPLICIT", "USER", "AGENT")
-            and "content" in step
-            and (i == 0 or steps[i - 1].get("type") != "PLANNER_RESPONSE" or not steps[i - 1].get("tool_calls"))
+        is_user_turn = (
+            stype == "USER_INPUT"
+            or is_parent_agent_message(step)
+            or (
+                stype == "GENERIC"
+                and source in ("USER_EXPLICIT", "USER", "AGENT")
+                and "content" in step
+                and (i == 0 or steps[i - 1].get("type") != "PLANNER_RESPONSE" or not steps[i - 1].get("tool_calls"))
+            )
         )
 
         if is_user_turn:
