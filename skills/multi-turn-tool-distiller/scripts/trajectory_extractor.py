@@ -278,8 +278,21 @@ def parse_transcript(
                             msg_arg = {"Message": msg_arg}
                     delivered_text = str(msg_arg.get("Message") or raw_content).strip()
                     s_thinks, s_body = split_think_and_body(delivered_text)
-                    final_thinks = s_thinks or thinks
+                    final_thinks = list(s_thinks or thinks)
                     final_body = s_body or body
+
+                    # Harvest any <think> emitted in trailing PLANNER_RESPONSE right after send_message
+                    while (
+                        j < n
+                        and steps[j].get("type") == "PLANNER_RESPONSE"
+                        and not steps[j].get("tool_calls")
+                    ):
+                        trail_text = str(steps[j].get("content") or "").strip()
+                        t_thinks, _ = split_think_and_body(trail_text)
+                        if t_thinks and not final_thinks:
+                            final_thinks.extend(t_thinks)
+                        j += 1
+
                     if final_thinks:
                         conversations.append(
                             {"from": "gpt", "value": f"<think>\n{final_thinks[-1]}\n</think>\n{final_body}"}
@@ -287,13 +300,6 @@ def parse_transcript(
                     else:
                         conversations.append({"from": "gpt", "value": final_body})
 
-                    # Skip any trailing short ack PLANNER_RESPONSE right after send_message before next user turn
-                    while (
-                        j < n
-                        and steps[j].get("type") == "PLANNER_RESPONSE"
-                        and not steps[j].get("tool_calls")
-                    ):
-                        j += 1
                     i = j
                     continue
 
@@ -398,11 +404,16 @@ def check_prm_grounding(
                     # Extract basename or key token
                     tokens = re.findall(r"[A-Za-z0-9_\-\.]{3,}", v)
                     candidate_anchors.extend(tok.lower() for tok in tokens[:4])
-            # Also collect tokens from the most recent human turn
+            # Also collect tokens from the most recent human turn (including ASCII words and 2-char CJK terms)
             for back_i in range(gpt_idx - 1, -1, -1):
                 if conversations[back_i].get("from") == "human":
-                    h_tokens = re.findall(r"[\w\-\.]{2,}", conversations[back_i].get("value", ""))
+                    h_val = conversations[back_i].get("value", "")
+                    h_tokens = re.findall(r"[A-Za-z0-9_\-\.]{2,}", h_val)
                     candidate_anchors.extend(tok.lower() for tok in h_tokens[:8])
+                    cjk_Seqs = re.findall(r"[\u4e00-\u9fff]{2,}", h_val)
+                    for seq in cjk_Seqs[:4]:
+                        for k in range(len(seq) - 1):
+                            candidate_anchors.append(seq[k : k + 2])
                     break
 
             low_think = cleaned.lower()
@@ -568,6 +579,69 @@ def build_tools_json_string(
     return json.dumps(tool_defs, ensure_ascii=False)
 
 
+def build_auto_stage2_prompt(
+    stage2_context: List[Dict[str, Any]],
+    target_nodes: List[int],
+    strategy: str = "strategy_star",
+) -> str:
+    """Automatically build a compact, token-efficient Stage-2 prompt for distill_rationalizer_agent."""
+    if not target_nodes:
+        return ""
+    strategy_titles = {
+        "strategy_star": "STaR Post-hoc Rationalization (已知动作与真实 Observation 逆向归因)",
+        "strategy_mpcot": "MPCoT Multi-Perspective Orthogonal Decomposition (意图/状态/工具正交分解合成)",
+        "strategy_pot": "PoT Execution-Evidence Grounded Synthesis (命令/路径/输出执行证据锚定)",
+        "strategy_cotevo": "CoT-Evo Candidate Selection & Merge (多视角择优融合)",
+        "strategy_prefill": "Context-Prefill Guided Completion (顺承上下文第一视角补全)",
+    }
+    title = strategy_titles.get(strategy, strategy)
+    compact_nodes = json.dumps(stage2_context, ensure_ascii=False, indent=2)
+    keys_template = ",\n".join(f'  "{idx}": "..."' for idx in target_nodes)
+    return (
+        f"[Stage-2 Operator: {strategy} — {title}]\n"
+        f"请针对待补全节点索引列表 {target_nodes}，基于以下第一阶段真实执行轨迹上下文，"
+        f"为每个目标节点生成一段自然、简明的高层推理摘要（2~3 句话，直接说明该步的目标、所选工具与参数依据或从观察结果得出最终结论的直接步骤）：\n\n"
+        f"```json\n{compact_nodes}\n```\n\n"
+        f"请严格仅输出如下格式的合法 JSON 对象（不要输出额外文字）：\n"
+        f"```json\n{{\n{keys_template}\n}}\n```"
+    )
+
+
+def extract_last_assistant_text_from_transcript(transcript_path: Path) -> str:
+    """Extract the final assistant text or send_message payload from a Stage-2 subagent transcript."""
+    if not transcript_path.exists():
+        fallback = transcript_path.parent / "transcript.jsonl"
+        if fallback.exists():
+            transcript_path = fallback
+        else:
+            raise FileNotFoundError(f"Stage-2 transcript not found: {transcript_path}")
+
+    steps = [
+        json.loads(line)
+        for line in transcript_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    for step in reversed(steps):
+        if step.get("type") != "PLANNER_RESPONSE":
+            continue
+        tcs = step.get("tool_calls") or []
+        for tc in tcs:
+            if tc.get("name") == "send_message":
+                args = tc.get("args") or {}
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args)
+                    except Exception:
+                        args = {"Message": args}
+                msg = str(args.get("Message") or "").strip()
+                if msg:
+                    return msg
+        content = str(step.get("content") or "").strip()
+        if content and "{" in content and "}" in content:
+            return content
+    raise ValueError(f"No JSON object found in Stage-2 transcript: {transcript_path}")
+
+
 def cmd_inspect(args: argparse.Namespace) -> int:
     transcript_path = Path(args.transcript).resolve()
     conversations, used_tools, user_turns = parse_transcript(transcript_path)
@@ -578,6 +652,8 @@ def cmd_inspect(args: argparse.Namespace) -> int:
         conversations, used_tools, target_nodes
     )
     tools_str = build_tools_json_string(used_tools)
+    stage2_ctx = build_stage2_context(conversations, target_nodes)
+    top_strategy = recommended_strategies[0] if recommended_strategies else "strategy_star"
 
     payload = {
         "sample_id": args.sample_id,
@@ -591,7 +667,8 @@ def cmd_inspect(args: argparse.Namespace) -> int:
         "completed_turns": user_turns,
         "expected_turns": args.expected_turns,
         "used_tools": used_tools,
-        "stage2_context": build_stage2_context(conversations, target_nodes),
+        "stage2_context": stage2_ctx,
+        "auto_stage2_prompt": build_auto_stage2_prompt(stage2_ctx, target_nodes, top_strategy),
         "sharegpt_record": {
             "system": args.system
             or "You are a helpful assistant capable of multi-turn reasoning and tool invocation.",
@@ -648,8 +725,13 @@ def cmd_merge_stage2(args: argparse.Namespace) -> int:
     inspected_path = Path(args.inspected).resolve()
     payload = json.loads(inspected_path.read_text(encoding="utf-8"))
 
-    stage2_path = Path(args.stage2_json).resolve()
-    raw_stage2 = stage2_path.read_text(encoding="utf-8")
+    if getattr(args, "stage2_transcript", None):
+        raw_stage2 = extract_last_assistant_text_from_transcript(Path(args.stage2_transcript).resolve())
+    elif getattr(args, "stage2_json", None):
+        stage2_path = Path(args.stage2_json).resolve()
+        raw_stage2 = stage2_path.read_text(encoding="utf-8")
+    else:
+        raise ValueError("Either --stage2-transcript or --stage2-json must be provided to merge-stage2.")
     mapping = parse_stage2_mapping(raw_stage2)
 
     conversations: List[Dict[str, str]] = payload["sharegpt_record"]["conversations"]
@@ -826,7 +908,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_merge = subparsers.add_parser("merge-stage2", help="Merge Stage-2 model-generated rationales and run PRM verification.")
     p_merge.add_argument("--inspected", required=True, help="Path to inspected JSON payload.")
-    p_merge.add_argument("--stage2-json", required=True, help="Path to JSON file containing Stage-2 rationalizer output.")
+    p_merge.add_argument("--stage2-json", default="", help="Path to JSON file containing Stage-2 rationalizer output.")
+    p_merge.add_argument("--stage2-transcript", default="", help="Path to Stage-2 subagent transcript_full.jsonl (direct extraction).")
     p_merge.add_argument("--strategy", default="strategy_star", help="Name of Stage-2 strategy applied.")
     p_merge.add_argument("--output", default="", help="Output path (defaults to overwriting --inspected).")
 
@@ -834,6 +917,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8")
     parser = build_parser()
     args = parser.parse_args()
     if args.self_test:

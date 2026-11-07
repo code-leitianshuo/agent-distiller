@@ -1,6 +1,6 @@
 {
   "created_at": "2026-11-07T11:42:10.618856+00:00",
-  "updated_at": "2026-11-07T11:47:06.702412+00:00",
+  "updated_at": "2026-11-07T12:32:08.040649+00:00",
   "max_retries": 5,
   "samples": {
     "seed_code_audit_01": {
@@ -46,7 +46,7 @@
         "请检查当前工作区是否存在未追踪或未提交的变更（git status），并汇总当前仓库的整体状态。"
       ],
       "target_turns": 2,
-      "status": "pending",
+      "status": "completed",
       "retry_count": 0,
       "profile_type": "UNPROFILED",
       "recommended_strategies": [
@@ -59,8 +59,14 @@
       "tried_strategies": [],
       "next_strategy": "strategy_star",
       "last_diagnosis": "",
-      "subagent_history": [],
-      "updated_at": "2026-11-07T11:42:10.618856+00:00"
+      "subagent_history": [
+        "59b799ec-9db2-4b77-92d6-96261ba87c45"
+      ],
+      "updated_at": "2026-11-07T12:28:05.460349+00:00",
+      "template_used": "strategy_pot",
+      "completed_at": "2026-11-07T12:32:08.040649+00:00",
+      "output_file": "F:\\zl\\datasets\\sharegpt_train.jsonl",
+      "message_count": 22
     },
     "seed_schema_check_03": {
       "sample_id": "seed_schema_check_03",
@@ -72,7 +78,7 @@
         "如果一条待写入记录的 tools 字段传入了 Python list 而不是 JSON 字符串，validate_pure_sharegpt 函数会如何处理？请结合代码逻辑说明。"
       ],
       "target_turns": 2,
-      "status": "pending",
+      "status": "completed",
       "retry_count": 0,
       "profile_type": "UNPROFILED",
       "recommended_strategies": [
@@ -85,8 +91,14 @@
       "tried_strategies": [],
       "next_strategy": "strategy_star",
       "last_diagnosis": "",
-      "subagent_history": [],
-      "updated_at": "2026-11-07T11:42:10.618856+00:00"
+      "subagent_history": [
+        "969f36be-46f2-4387-a9be-e09f59f366ed"
+      ],
+      "updated_at": "2026-11-07T12:28:05.589460+00:00",
+      "template_used": "strategy_star",
+      "completed_at": "2026-11-07T12:31:30.986038+00:00",
+      "output_file": "F:\\zl\\datasets\\sharegpt_train.jsonl",
+      "message_count": 7
     }
   },
   "input_source": "F:\\zl\\skills\\multi-turn-tool-distiller\\examples\\seed_examples.jsonl"

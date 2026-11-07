@@ -111,13 +111,12 @@ description: >-
 
 3. **分支 B：启动阶段二算子回退循环 (`needs_stage2 == true`)**：
    按 `recommended_strategies` 顺序依次取出未尝试的算子 `strategy_name`：
-   - **步骤 4.1**：查阅 [prompt_strategies.md](./references/prompt_strategies.md) 第 3.2 节中对应 `strategy_name` 的算子模板，将 `datasets/tmp_<sample_id>.json` 中的轨迹上下文与 `target_node_indices` 组装为 Prompt，调用 `invoke_subagent(TypeName="distill_rationalizer_agent", ...)`。
-   - **步骤 4.2**：收到 `distill_rationalizer_agent` 返回的 JSON 映射后，立即调用 `manage_subagents(Action="kill")` 销毁该重构子代理，并将返回的 JSON 保存至 `datasets/stage2_<sample_id>.json`。
-   - **步骤 4.3**：运行 `merge-stage2` 合成完整轨迹并执行 **PRM 过程一致性校验**：
+   - **步骤 4.1**：直接读取 `datasets/tmp_<sample_id>.json` 中自动生成的 `auto_stage2_prompt`（或查阅 [prompt_strategies.md](./references/prompt_strategies.md) 第 3.2 节中对应 `strategy_name` 的模板），调用 `invoke_subagent(TypeName="distill_rationalizer_agent", ...)`。
+   - **步骤 4.2**：收到 `distill_rationalizer_agent` 回复后，直接调用 `merge-stage2` 传入该阶段二子代理的 `--stage2-transcript` 路径（无需手动复制粘贴 JSON），合成完整轨迹并执行 **PRM 过程一致性校验**，随后调用 `manage_subagents(Action="kill")` 销毁阶段二子代理：
      ```powershell
      python skills/multi-turn-tool-distiller/scripts/trajectory_extractor.py merge-stage2 `
        --inspected "datasets/tmp_<sample_id>.json" `
-       --stage2-json "datasets/stage2_<sample_id>.json" `
+       --stage2-transcript "<appDataDir>/brain/<stage2_subagent_id>/.system_generated/logs/transcript_full.jsonl" `
        --strategy "<strategy_name>" `
        --output "datasets/tmp_<sample_id>.json"
      ```

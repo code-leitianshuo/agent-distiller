@@ -48,6 +48,8 @@ def validate_pure_sharegpt(record: Dict[str, Any]) -> Dict[str, Any]:
     system_val = str(record.get("system") or "")
     tools_val = record.get("tools", "[]")
     if not isinstance(tools_val, str):
+        if not isinstance(tools_val, list):
+            raise ValueError("'tools' field must be a list or a JSON string representing a list.")
         tools_val = json.dumps(tools_val, ensure_ascii=False)
     else:
         # Ensure it parses as JSON array
@@ -260,6 +262,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8")
     parser = build_parser()
     args = parser.parse_args()
     if args.self_test:
