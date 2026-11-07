@@ -1,115 +1,155 @@
-# Prompt Strategies & Mutation Templates (`prompt_strategies.md`)
+# Two-Stage Adaptive Distillation Strategies (`prompt_strategies.md`)
 
-本文件定义 Main-Agent 在拉起 `distill_teacher_agent` 及推进多轮追问时使用的基础系统提示词与三级变异引导模板（Template A / B / C）。
+本文件定义双阶段自适应蒸馏架构下的：
+1. **阶段一执行子代理 (`distill_executor_agent`) 的轻量级自然引导系统提示词**（无填空槽位，无同题示例污染）；
+2. **Main-Agent 智能模型与轨迹画像矩阵（Adaptive Profiler Matrix）**；
+3. **阶段二重构子代理 (`distill_rationalizer_agent`) 的五级回退算子库（Fallback Waterfall）**。
 
 ---
 
-## 1. Sub-Agent 基础系统提示词 (`define_subagent` SystemPrompt)
+## 1. 阶段一：轻量级自然执行系统提示词 (`distill_executor_agent`)
+
+阶段一的目标是让教师模型在零包装干扰的自然多轮对话中，真实调用宿主工具完成任务，并自然输出高层推理摘要。
 
 ```markdown
-You are an expert technical assistant executing multi-turn tasks with real workspace and MCP tools.
-Follow these output formatting rules on every turn and before every tool call:
+You are a capable technical assistant solving multi-turn tasks with real workspace and MCP tools.
+When working through a user request:
+- Feel free to naturally summarize your direct reasoning inside `<think>...</think>` tags before invoking a tool or presenting your final answer.
+- Focus on solving the user's actual request accurately using the available tools. Do not follow rigid slot templates; express your direct reasoning naturally in a few concise sentences based on the real task context and tool outputs.
+- Complete only the current turn's request and wait for the user's next message.
+```
 
-1. Before invoking any tool (`function_call`), always output a `<think>...</think>` block in your message text that concisely states the current information need, why the target tool is selected, and the direct basis for its argument values.
-2. After receiving a tool's execution output (`observation`) and before presenting your final response for the turn, always output a `<think>...</think>` block that concisely summarizes the key result from the tool output and the direct steps to answer the user's request.
-3. On turns that do not require a tool call, always begin your response with a `<think>...</think>` block that briefly summarizes the direct reasoning steps leading to your answer.
-4. Keep every `<think>...</think>` block clear, structured, and concise (a few sentences covering only the direct steps leading to the action or answer).
-5. Address only the user's current turn request and stop once your response for the current turn is complete.
+> **重要原则**：在阶段一向 `distill_executor_agent` 发送首轮 `Prompt` 及后续 `send_message` 追问时，**直接发送纯净的用户问题文本**，严禁附加 `[Task Execution Protocol]` 外壳或尾部格式提醒，确保模型的工具决策与回答分布完全自然。
+
+---
+
+## 2. Main-Agent 智能画像与算子选择矩阵（Adaptive Profiler Matrix）
+
+当阶段一执行完毕后，Main-Agent 运行 `trajectory_extractor.py inspect` 对原始轨迹与模型响应特征进行诊断，自动判定模型输出类型并生成阶段二算子优先级队列：
+
+| 画像分类 (`profile_type`) | 阶段一轨迹特征表现 | 智能推荐的 Stage-2 算子回退顺序 (`recommended_strategies`) |
+| :--- | :--- | :--- |
+| `DIRECT_COMPLETE` | 所有工具调用步与最终回复步均已自然包含非空且与上下文一致的 `<think>...</think>` | 无需启动阶段二，直接进入 PRM 一致性校验与落盘 |
+| `TOOL_SILENT_NATIVE` | 最终回复步包含自然 `<think>`，但模型在发起原生 `tool_call` 时仅下发工具指令而省略了同轮文本 `<think>` | `strategy_star` -> `strategy_prefill` -> `strategy_mpcot` -> `strategy_pot` -> `strategy_cotevo` |
+| `CLI_SYMBOLIC_EXECUTION` | 轨迹包含命令行脚本执行（`run_command`）、数值统计或结构化文件变更，需将推理严格锚定到执行输出 | `strategy_pot` -> `strategy_star` -> `strategy_mpcot` -> `strategy_cotevo` -> `strategy_prefill` |
+| `MULTI_HOP_TOOL_CHAIN` | 单轮或多轮内连续调用 $\ge 2$ 种不同工具，涉及多步信息串联与跨工具参数传递 | `strategy_mpcot` -> `strategy_star` -> `strategy_cotevo` -> `strategy_pot` -> `strategy_prefill` |
+| `STRICT_GUARDED_MINIMAL` | 阶段一全程仅输出最终结论正文与工具调用，未输出任何 `<think>` 标签 | `strategy_star` -> `strategy_cotevo` -> `strategy_mpcot` -> `strategy_pot` -> `strategy_prefill` |
+
+---
+
+## 3. 阶段二：重构子代理 (`distill_rationalizer_agent`) 与五级回退算子库
+
+### 3.1 `distill_rationalizer_agent` 基础系统提示词 (`define_subagent`)
+
+```markdown
+You are a trajectory rationale synthesizer for multi-turn tool-use conversations.
+Given a verified ground-truth execution trajectory (containing user questions, actual tool calls with arguments, real tool observations, and final answers), your job is to reconstruct natural, context-grounded `<think>...</think>` reasoning summaries for any decision nodes marked as needing rationale synthesis.
+Rules:
+1. Every generated rationale must be genuinely derived from the specific user question, the exact tool name and arguments called, or the real observation returned in that trajectory. Never use generic boilerplate.
+2. Keep each rationale concise and direct (a high-level summary in a few sentences covering the direct steps leading to the tool call or final answer).
+3. Output strictly a valid JSON object mapping each target `node_index` (as a string key) to its reconstructed reasoning text (without outer `<think>` tags, as the merger wraps them automatically).
 ```
 
 ---
 
-## 2. 三级提示词引导与变异模板库（Mutation Templates）
+### 3.2 五级回退重构算子模板（Fallback Waterfall Strategies）
 
-### Template A：默认模式 — 结构化白盒推演模板（Retry = 0）
+当 Main-Agent 调用 `distill_rationalizer_agent` 执行阶段二时，将 `trajectory_extractor.py inspect` 生成的待补全节点上下文 `{{TRAJECTORY_CONTEXT_JSON}}` 与目标节点列表 `{{TARGET_NODE_INDICES}}` 填入所选算子模板：
 
-适用于首次拉起 Sub-Agent。强调在工具调用前与最终回复前输出清晰的 `<think>...</think>` 块。
+#### 算子 1：`strategy_star` — 已知答案与真实 Observation 逆向归因（STaR Post-hoc Rationalization）
+- **适用场景**：默认首选算子（尤其针对 `TOOL_SILENT_NATIVE` 與 `STRICT_GUARDED_MINIMAL`）。已知模型实际发起的 `function_call` 或最终回答，逆向归因连接“问题/观察”与“动作/结论”的直接逻辑桥梁。
+- **调用 Prompt**：
+  ```markdown
+  [Stage-2 Operator: strategy_star (STaR Post-hoc Rationalization)]
+  以下是第一阶段真实执行并通过环境验证的多轮工具调用轨迹上下文：
+  ```json
+  {{TRAJECTORY_CONTEXT_JSON}}
+  ```
+  请针对待补全/重构的节点索引列表 `{{TARGET_NODE_INDICES}}`，运用已知动作/结果逆向归因法（STaR）：
+  - 若目标节点后接 `function_call`：结合当前轮次的 `human` 提问与前序观察，直接说明为何需要调用该具体工具以及所传参数值的来源；
+  - 若目标节点为 `observation` 后的最终 `gpt` 回复：结合工具真实返回的数据与最终回答内容，直接概括从工具输出得出最终答复的核心逻辑步骤。
 
-**首轮包装模板**：
-```markdown
-[Task Execution & Output Protocol - Template A]
-请完成以下任务。在执行过程中请严格遵守 `<think>...</think>` 输出规范：
-- **调用工具前**：先在正文中输出 `<think>...</think>`，用简明直接的几句话说明当前需要获取什么信息、选择哪个工具以及参数取值的直接依据，然后再发起工具调用。
-- **工具返回后 / 最终回复前**：先在正文中输出 `<think>...</think>`，简要概括工具返回的核心结果及得出最终回答的直接步骤，随后在 `</think>` 之后输出正式回答。
+  请仅输出如下格式的合法 JSON 对象（不要输出额外解释）：
+  ```json
+  {
+    "<node_index>": "针对该节点的自然、简明高层推理摘要文本..."
+  }
+  ```
+  ```
 
-**示例格式**：
-<think>
-需要读取项目的插件配置文件以确认插件名称和版本号。我将调用 read_file 工具读取 plugin.json 文件的内容。
-</think>
-（发起工具调用 read_file）
+#### 算子 2：`strategy_mpcot` — 多视角正交分解合成（MPCoT Orthogonal Decomposition）
+- **适用场景**：多跳工具调用链（`MULTI_HOP_TOOL_CHAIN`）或 `strategy_star` 未通过一致性校验时的回退算子。
+- **调用 Prompt**：
+  ```markdown
+  [Stage-2 Operator: strategy_mpcot (Multi-Perspective Orthogonal Decomposition)]
+  以下是第一阶段真实执行的多轮工具调用轨迹：
+  ```json
+  {{TRAJECTORY_CONTEXT_JSON}}
+  ```
+  请针对节点 `{{TARGET_NODE_INDICES}}`，综合以下正交视角（用户任务意图、当前已知/未知环境状态、工具接口参数或返回结果）提炼出一句到数句话的自然连贯高层推理摘要，准确衔接上下文与下一步工具调用或最终答复。
 
-<think>
-plugin.json 显示插件名称为 agent-distiller，版本为 1.0.0。接下来直接向用户汇报这些配置信息。
-</think>
-该项目的插件名称为 `agent-distiller`，当前版本号为 `1.0.0`。
+  请仅输出如下格式的合法 JSON 对象：
+  ```json
+  {
+    "<node_index>": "融合意图、状态与参数/结果的自然高层推理摘要..."
+  }
+  ```
+  ```
 
----
-【用户第 1 轮提问】：
-{{USER_QUESTION}}
-```
+#### 算子 3：`strategy_pot` — 程序与执行证据锚定推演（PoT Execution-Grounded Synthesis）
+- **适用场景**：涉及 `run_command`、代码分析、文件校验或数值统计的任务（`CLI_SYMBOLIC_EXECUTION`）。
+- **调用 Prompt**：
+  ```markdown
+  [Stage-2 Operator: strategy_pot (Execution-Evidence Grounded Synthesis)]
+  以下是包含真实命令行/文件工具执行证据的轨迹上下文：
+  ```json
+  {{TRAJECTORY_CONTEXT_JSON}}
+  ```
+  请针对节点 `{{TARGET_NODE_INDICES}}`，严格以轨迹中的实际命令字符串、文件路径、退出码及标准输出中的关键数据为锚点，生成简明直接的高层推理摘要，确保推理中引用的命令、路径或输出结论与实际执行记录 100% 吻合。
 
-**多轮追问包装模板**：
-```markdown
-【用户第 {{TURN_INDEX}} 轮追问】：
-{{FOLLOWUP_QUESTION}}
+  请仅输出如下格式的合法 JSON 对象：
+  ```json
+  {
+    "<node_index>": "锚定具体命令/路径与执行输出的自然推理摘要..."
+  }
+  ```
+  ```
 
-（提醒：若需调用工具，请先输出 `<think>...</think>` 简要说明工具与参数依据再调用工具；在给出本轮最终回答前，同样请先输出 `<think>...</think>` 概括核心结论步骤。）
-```
+#### 算子 4：`strategy_cotevo` — 多候选生成与演化择优融合（CoT-Evo Candidate Merge）
+- **适用场景**：当前序算子出现信息遗漏或未能通过 PRM 相关性校验时的强化回退算子。
+- **调用 Prompt**：
+  ```markdown
+  [Stage-2 Operator: strategy_cotevo (Evolutionary Candidate Selection & Merge)]
+  上一轮重构未通过校验原因：{{LAST_AUDIT_ERRORS}}
+  轨迹上下文如下：
+  ```json
+  {{TRAJECTORY_CONTEXT_JSON}}
+  ```
+  请针对节点 `{{TARGET_NODE_INDICES}}`，综合“工具调用必要性”与“上下文关键实体精确匹配”两个维度的最优表达，去除了任何空洞套话，合成一段高信息密度、自然流畅的数句话高层推理摘要。
 
----
+  请仅输出如下格式的合法 JSON 对象：
+  ```json
+  {
+    "<node_index>": "经择优融合后的自然高层推理摘要..."
+  }
+  ```
+  ```
 
-### Template B：变异模式 1 — 决策槽位对齐模板（Retry = 1）
+#### 算子 5：`strategy_prefill` — 决策上下文前缀续写补全（Prefill-Guided Completion）
+- **适用场景**：兜底算子，通过给定上下文锚点引导模型自然续写直至动作或结论。
+- **调用 Prompt**：
+  ```markdown
+  [Stage-2 Operator: strategy_prefill (Context-Prefill Guided Completion)]
+  轨迹上下文如下：
+  ```json
+  {{TRAJECTORY_CONTEXT_JSON}}
+  ```
+  请针对节点 `{{TARGET_NODE_INDICES}}`，直接站在助手执行到该步时的第一视角，顺承上一条消息的具体内容，用简明直接的几句话补全导向该步工具调用或最终答复的思考摘要。
 
-当 Template A 出现 `<think>` 块缺失（如直接调用工具未输出文本 `<think>`）或格式不闭合时切换至本模板，通过显式三要素槽位锁定输出结构。
-
-**首轮包装模板**：
-```markdown
-[Task Execution & Output Protocol - Template B (Slot-Aligned Mode)]
-上一轮执行诊断提示：{{AUDIT_DIAGNOSIS}}
-
-请重新完成以下任务。每一次回复（包括发起工具调用的动作前、以及生成最终答复前）都必须以闭合的 `<think>...</think>` 标签开头，且内部按以下简明要点组织（保持数句话的高层直接总结）：
-1. **目标与依据**：当前步骤要解决的具体问题或已获取的观察结果；
-2. **工具/行动选择**：所选用的具体工具名称与关键参数（若为最终回复则说明结论要点）；
-3. **直接结论**：下一步动作或最终答复方向。
-
-**标准示例**：
-<think>
-当前需要统计 skills 目录下的 Python 脚本数量。我选择调用 run_command 执行目录文件查询命令，目标路径设为 skills/multi-turn-tool-distiller/scripts。
-</think>
-（发起工具调用 run_command）
-
----
-【用户第 1 轮提问】：
-{{USER_QUESTION}}
-```
-
----
-
-### Template C：变异模式 2 — 强制审计核验清单模板（Retry = 2）
-
-当 Retry = 1 仍出现特定节点 `<think>` 遗漏或参数异常时使用，在每次交互中附带强制自检清单。
-
-**首轮包装模板**：
-```markdown
-[Task Execution & Output Protocol - Template C (Strict Audit Checklist)]
-历史审计未通过原因：{{AUDIT_DIAGNOSIS}}
-
-请严格按照以下核验清单执行本任务：
-- [必检 1] 禁止在无正文文本的情况下裸调工具！每次调用工具的同一步响应中，必须同时输出包含 `<think>...</think>` 的文本说明。
-- [必检 2] 工具返回 `observation` 后的最终总结回复中，开头必须包含 `<think>...</think>` 标签，然后换行输出正式回答正文。
-- [必检 3] `<think>...</think>` 内仅保留直达结论的简明核心逻辑（2~4 句话），确保标签成对闭合。
-
----
-【用户第 1 轮提问】：
-{{USER_QUESTION}}
-```
-
----
-
-## 3. 多轮追问（User Simulator）动态生成指南
-
-当种子未提供固定 `follow_ups` 时，Main-Agent 在收到第 $k$ 轮回复后，按以下策略之一生成第 $k+1$ 轮 `human` 追问：
-
-1. **深度验证追问（Verification Follow-up）**：基于第 $k$ 轮工具读取到的文件或命令输出，要求进一步检查关联文件或运行验证命令（例如：“既然已经确认了配置文件中的脚本路径，请进一步检查 `scripts/` 下对应脚本的命令行参数定义并运行一次自检命令。”）。
-2. **条件变更/增量任务（Incremental Requirement）**：在上一轮结果基础上增加过滤条件、格式化要求或边界检查（例如：“请在此基础上统计各模块的函数数量，并将汇总结果写入临时报告文件后验证文件内容。”）。
-3. **异常与边界排查（Boundary Probe）**：针对工具返回的数据结构或潜在异常情况提出追问，促使 Sub-Agent 再次调用工具核实或结合已有上下文给出严谨答复。
+  请仅输出如下格式的合法 JSON 对象：
+  ```json
+  {
+    "<node_index>": "顺承上下文自然补全的高层推理摘要..."
+  }
+  ```
+  ```

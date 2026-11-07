@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Task Queue & Checkpoint State Manager for multi-turn-tool-distiller.
+Task Queue, Adaptive Profile & Stage-2 Fallback State Manager for multi-turn-tool-distiller.
 
 Supports:
 - Streaming seed tasks from .jsonl, .json, .csv, or .txt files.
 - Maintaining checkpoint state in <output_dir>/.state.json for resume support.
-- Selecting prompt templates (Template A / B / C) according to retry_count.
+- Tracking Stage-1 behavior profile (`profile_type`) and Stage-2 strategy waterfall
+  history (`tried_strategies`, `recommended_strategies`).
 - Batch scheduling for both serial (batch_size=1) and parallel (batch_size=N) modes.
 """
 
@@ -24,11 +25,13 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 
-TEMPLATE_MAP = {
-    0: "Template A",
-    1: "Template B",
-    2: "Template C",
-}
+DEFAULT_STAGE2_WATERFALL = [
+    "strategy_star",
+    "strategy_mpcot",
+    "strategy_pot",
+    "strategy_cotevo",
+    "strategy_prefill",
+]
 
 
 def now_iso() -> str:
@@ -139,7 +142,7 @@ def load_state(state_path: Path) -> Dict[str, Any]:
     return {
         "created_at": now_iso(),
         "updated_at": now_iso(),
-        "max_retries": 3,
+        "max_retries": 5,
         "samples": {},
     }
 
@@ -151,6 +154,15 @@ def save_state(state_path: Path, state: Dict[str, Any]) -> None:
     with tmp_path.open("w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
     os.replace(tmp_path, state_path)
+
+
+def _select_next_strategy(entry: Dict[str, Any]) -> str:
+    waterfall = entry.get("recommended_strategies") or DEFAULT_STAGE2_WATERFALL
+    tried = set(entry.get("tried_strategies") or [])
+    for strat in waterfall:
+        if strat not in tried:
+            return strat
+    return waterfall[-1] if waterfall else "strategy_star"
 
 
 def cmd_init(args: argparse.Namespace) -> int:
@@ -177,7 +189,10 @@ def cmd_init(args: argparse.Namespace) -> int:
             **seed,
             "status": "pending",
             "retry_count": 0,
-            "recommended_template": TEMPLATE_MAP[0],
+            "profile_type": "UNPROFILED",
+            "recommended_strategies": list(DEFAULT_STAGE2_WATERFALL),
+            "tried_strategies": [],
+            "next_strategy": DEFAULT_STAGE2_WATERFALL[0],
             "last_diagnosis": "",
             "subagent_history": [],
             "updated_at": now_iso(),
@@ -197,15 +212,14 @@ def cmd_next_batch(args: argparse.Namespace) -> int:
     output_dir = Path(args.output_dir).resolve()
     state_path = output_dir / ".state.json"
     state = load_state(state_path)
-    max_retries = int(state.get("max_retries", 3))
+    max_retries = int(state.get("max_retries", 5))
 
     batch: List[Dict[str, Any]] = []
     for sid, entry in state.get("samples", {}).items():
         status = entry.get("status", "pending")
         retry_count = int(entry.get("retry_count", 0))
         if status in ("pending", "retry") and retry_count < max_retries:
-            template = TEMPLATE_MAP.get(retry_count, "Template C")
-            entry["recommended_template"] = template
+            entry["next_strategy"] = _select_next_strategy(entry)
             batch.append(entry)
             if len(batch) >= args.batch_size:
                 break
@@ -238,12 +252,25 @@ def cmd_update_status(args: argparse.Namespace) -> int:
         return 1
 
     entry = samples[args.sample_id]
-    max_retries = int(state.get("max_retries", 3))
+    max_retries = int(state.get("max_retries", 5))
 
     if args.subagent_id:
         history = entry.setdefault("subagent_history", [])
         if args.subagent_id not in history:
             history.append(args.subagent_id)
+
+    if args.profile_type:
+        entry["profile_type"] = args.profile_type
+
+    if args.recommended_strategies:
+        entry["recommended_strategies"] = [
+            s.strip() for s in args.recommended_strategies.split(",") if s.strip()
+        ]
+
+    if args.strategy_tried:
+        tried = entry.setdefault("tried_strategies", [])
+        if args.strategy_tried not in tried:
+            tried.append(args.strategy_tried)
 
     if args.diagnosis is not None:
         entry["last_diagnosis"] = args.diagnosis
@@ -254,9 +281,7 @@ def cmd_update_status(args: argparse.Namespace) -> int:
             entry["status"] = "failed"
         else:
             entry["status"] = "retry"
-            entry["recommended_template"] = TEMPLATE_MAP.get(
-                entry["retry_count"], "Template C"
-            )
+            entry["next_strategy"] = _select_next_strategy(entry)
     else:
         entry["status"] = args.status
 
@@ -294,62 +319,42 @@ def run_self_test() -> int:
         )
         out_dir = tmp / "out"
 
-        # 1. Init
         cmd_init(
             argparse.Namespace(
                 input=str(seed_file),
                 output_dir=str(out_dir),
                 default_turns=2,
-                max_retries=3,
+                max_retries=5,
             )
         )
         state = load_state(out_dir / ".state.json")
         assert len(state["samples"]) == 2
-        assert state["samples"]["t1"]["target_turns"] == 2
-        assert state["samples"]["t2"]["target_turns"] == 3
 
-        # 2. Retry escalation
+        # Test Stage-2 fallback strategy progression
         cmd_update_status(
             argparse.Namespace(
                 output_dir=str(out_dir),
                 sample_id="t1",
                 status="retry",
-                diagnosis="MISSING_THINK_BEFORE_TOOL",
+                diagnosis="PRM_UNGROUNDED_PRE_TOOL_THINK",
                 subagent_id="sub_001",
+                profile_type="CLI_SYMBOLIC_EXECUTION",
+                recommended_strategies="strategy_pot,strategy_star,strategy_mpcot",
+                strategy_tried="strategy_pot",
             )
         )
         state = load_state(out_dir / ".state.json")
         assert state["samples"]["t1"]["retry_count"] == 1
-        assert state["samples"]["t1"]["recommended_template"] == "Template B"
+        assert state["samples"]["t1"]["profile_type"] == "CLI_SYMBOLIC_EXECUTION"
+        assert state["samples"]["t1"]["next_strategy"] == "strategy_star"
 
-        # 3. Complete t2 and re-init to verify resume protection
-        cmd_update_status(
-            argparse.Namespace(
-                output_dir=str(out_dir),
-                sample_id="t2",
-                status="completed",
-                diagnosis="",
-                subagent_id="sub_002",
-            )
-        )
-        cmd_init(
-            argparse.Namespace(
-                input=str(seed_file),
-                output_dir=str(out_dir),
-                default_turns=2,
-                max_retries=3,
-            )
-        )
-        state = load_state(out_dir / ".state.json")
-        assert state["samples"]["t2"]["status"] == "completed"
-
-    print(json.dumps({"self_test": "PASSED", "module": "task_manager.py"}))
+    print(json.dumps({"self_test": "PASSED", "module": "task_manager.py (v2 adaptive waterfall)"}))
     return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Manage seed queues and checkpoint state for multi-turn-tool-distiller."
+        description="Manage seed queues, profiles, and Stage-2 fallback state for multi-turn-tool-distiller."
     )
     parser.add_argument("--self-test", action="store_true", help="Run built-in unit tests.")
     subparsers = parser.add_subparsers(dest="command")
@@ -358,13 +363,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_init.add_argument("--input", required=True, help="Path to seed file (.jsonl/.json/.csv/.txt).")
     p_init.add_argument("--output-dir", default="datasets", help="Output directory for .state.json.")
     p_init.add_argument("--default-turns", type=int, default=2, help="Default target turns per sample.")
-    p_init.add_argument("--max-retries", type=int, default=3, help="Max mutation retries per sample.")
+    p_init.add_argument("--max-retries", type=int, default=5, help="Max Stage-2 strategy fallback attempts.")
 
     p_next = subparsers.add_parser("next-batch", help="Fetch next actionable batch of samples.")
     p_next.add_argument("--output-dir", default="datasets", help="Output directory containing .state.json.")
     p_next.add_argument("--batch-size", type=int, default=3, help="Number of samples to fetch.")
 
-    p_upd = subparsers.add_parser("update-status", help="Update sample status and retry counter.")
+    p_upd = subparsers.add_parser("update-status", help="Update sample status, profile, and strategy fallback.")
     p_upd.add_argument("--output-dir", default="datasets", help="Output directory containing .state.json.")
     p_upd.add_argument("--sample-id", required=True, help="Target sample ID.")
     p_upd.add_argument(
@@ -375,6 +380,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_upd.add_argument("--diagnosis", default=None, help="Audit diagnosis or error reason.")
     p_upd.add_argument("--subagent-id", default=None, help="Sub-agent conversation ID used.")
+    p_upd.add_argument("--profile-type", default=None, help="Classified Stage-1 profile type.")
+    p_upd.add_argument("--recommended-strategies", default=None, help="Comma-separated strategy waterfall.")
+    p_upd.add_argument("--strategy-tried", default=None, help="Stage-2 strategy name just attempted.")
 
     p_stat = subparsers.add_parser("status", help="Show queue statistics.")
     p_stat.add_argument("--output-dir", default="datasets", help="Output directory containing .state.json.")

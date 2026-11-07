@@ -1,11 +1,18 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Trajectory Extractor & Quality Auditor for multi-turn-tool-distiller.
+Two-Stage Trajectory Inspector, Adaptive Profiler, Stage-2 Merger & PRM Auditor
+for multi-turn-tool-distiller.
 
-Parses Antigravity subagent session transcripts (transcript_full.jsonl / transcript.jsonl),
-reconstructs ShareGPT multi-turn & tool-calling conversations, strips prompt-wrapper
-boilerplate from human turns, and audits <think> coverage and tool argument validity.
+Key Principles:
+- NEVER fabricates <think> text using hardcoded Python string templates.
+- Stage 1 (`inspect`): Extracts natural dialogue & tool calls from transcript_full.jsonl,
+  profiles the model's behavior (`profile_type`), locates any decision nodes missing
+  <think> or failing PRM consistency (`target_node_indices`), and outputs an ordered
+  Stage-2 strategy fallback list (`recommended_strategies`).
+- Stage 2 (`merge-stage2`): Merges genuine model-generated <think> rationales produced
+  by `distill_rationalizer_agent` (using STaR / MPCoT / PoT / CoT-Evo / Prefill) and
+  runs Process Reward Model (PRM) grounding and consistency verification.
 """
 
 from __future__ import annotations
@@ -100,6 +107,38 @@ BUILTIN_TOOL_SCHEMAS: Dict[str, Dict[str, Any]] = {
     },
 }
 
+STRATEGY_WATERFALL_BY_PROFILE: Dict[str, List[str]] = {
+    "DIRECT_COMPLETE": [],
+    "TOOL_SILENT_NATIVE": [
+        "strategy_star",
+        "strategy_prefill",
+        "strategy_mpcot",
+        "strategy_pot",
+        "strategy_cotevo",
+    ],
+    "CLI_SYMBOLIC_EXECUTION": [
+        "strategy_pot",
+        "strategy_star",
+        "strategy_mpcot",
+        "strategy_cotevo",
+        "strategy_prefill",
+    ],
+    "MULTI_HOP_TOOL_CHAIN": [
+        "strategy_mpcot",
+        "strategy_star",
+        "strategy_cotevo",
+        "strategy_pot",
+        "strategy_prefill",
+    ],
+    "STRICT_GUARDED_MINIMAL": [
+        "strategy_star",
+        "strategy_cotevo",
+        "strategy_mpcot",
+        "strategy_pot",
+        "strategy_prefill",
+    ],
+}
+
 # Match standalone <think>...</think> blocks not enclosed in inline backticks
 THINK_BLOCK_PATTERN = re.compile(r"(?<!`)<think>\s*(.*?)\s*</think>(?!`)", re.DOTALL | re.IGNORECASE)
 LEADING_THINK_PATTERN = re.compile(r"^\s*<think>\s*(.*?)\s*</think>\s*", re.DOTALL | re.IGNORECASE)
@@ -125,16 +164,14 @@ def is_parent_agent_message(step: Dict[str, Any]) -> bool:
 
 
 def clean_human_prompt(raw_content: str) -> str:
-    """Strip SYSTEM_MESSAGE envelope and prompt-strategy wrapper headers/footers."""
+    """Strip SYSTEM_MESSAGE envelope and any legacy wrapper headers if present."""
     text = raw_content.strip()
     env_match = SYSTEM_MSG_ENVELOPE.search(text)
     if env_match:
         text = env_match.group(1).strip()
-    # Match 【用户第 X 轮提问】： or 【用户第 X 轮追问】：
     marker_match = re.search(r"【用户第\s*\d+\s*轮(?:提问|追问)】：\s*(.*)", text, re.DOTALL)
     if marker_match:
         text = marker_match.group(1).strip()
-    # Strip trailing reminder block if present
     text = re.sub(r"\n*（提醒：若需调用工具.*?）\s*$", "", text, flags=re.DOTALL).strip()
     return text
 
@@ -158,35 +195,14 @@ def split_think_and_body(raw_text: str) -> Tuple[List[str], str]:
     return thinks, body
 
 
-def synthesize_concise_pre_tool_think(tool_name: str, args: Dict[str, Any]) -> str:
-    """
-    Build a concise, high-level direct summary when the native planner step invokes
-    a tool directly without emitting a separate inline text field in the same step.
-    """
-    if tool_name in ("read_file", "view_file"):
-        target = args.get("Path") or args.get("AbsolutePath") or "目标文件"
-        return f"需要读取文件 `{target}` 以获取满足当前任务所需的配置或代码内容。我将调用 `{tool_name}` 工具传入该路径参数进行读取。"
-    if tool_name == "write_file":
-        target = args.get("Path", "目标文件")
-        return f"需要将处理后的内容写入文件 `{target}`。我将调用 `write_file` 工具并传入目标路径与完整文件内容。"
-    if tool_name == "edit_file":
-        target = args.get("Path", "目标文件")
-        return f"需要对文件 `{target}` 的指定片段进行精确修改。我将调用 `edit_file` 工具传入目标路径、原文本与替换内容。"
-    if tool_name == "run_command":
-        cmd = args.get("CommandLine", "")
-        summary = args.get("toolSummary", "执行命令")
-        return f"需要通过命令行执行“{summary}”以获取实时输出。我将调用 `run_command` 工具运行 `{cmd}`。"
-    arg_keys = ", ".join(str(k) for k in args.keys()) if isinstance(args, dict) else ""
-    return f"需要调用工具 `{tool_name}` 获取任务所需信息。我将传入参数（{arg_keys}）执行该工具调用。"
-
-
 def parse_transcript(
     transcript_path: Path,
-    default_system: str = "",
 ) -> Tuple[List[Dict[str, str]], List[str], int]:
     """
-    Convert Antigravity transcript JSONL into ShareGPT conversations list.
-    Returns (conversations, used_tool_names, completed_user_turns).
+    Convert Antigravity transcript JSONL into raw ShareGPT conversations list.
+    Does NOT fabricate any <think> strings: if a tool call or response step lacks
+    <think>, its gpt value leaves the <think> absent so `inspect` marks it for Stage-2
+    model-based rationale synthesis.
     """
     if not transcript_path.exists():
         fallback = transcript_path.parent / "transcript.jsonl"
@@ -213,7 +229,6 @@ def parse_transcript(
         stype = step.get("type", "")
         source = step.get("source", "")
 
-        # Detect user or parent-agent follow-up input
         is_user_turn = (
             stype == "USER_INPUT"
             or is_parent_agent_message(step)
@@ -240,7 +255,6 @@ def parse_transcript(
             tool_calls = step.get("tool_calls") or []
 
             if tool_calls:
-                # Look ahead for corresponding GENERIC tool result steps
                 obs_steps: List[str] = []
                 j = i + 1
                 while j < n and len(obs_steps) < len(tool_calls):
@@ -251,8 +265,42 @@ def parse_transcript(
                     else:
                         break
 
+                # Check if tool_calls is solely `send_message` delivering the turn's final answer to parent agent
+                non_send_calls = [tc for tc in tool_calls if tc.get("name") != "send_message"]
+                send_calls = [tc for tc in tool_calls if tc.get("name") == "send_message"]
+
+                if send_calls and not non_send_calls:
+                    msg_arg = send_calls[-1].get("args") or {}
+                    if isinstance(msg_arg, str):
+                        try:
+                            msg_arg = json.loads(msg_arg)
+                        except Exception:
+                            msg_arg = {"Message": msg_arg}
+                    delivered_text = str(msg_arg.get("Message") or raw_content).strip()
+                    s_thinks, s_body = split_think_and_body(delivered_text)
+                    final_thinks = s_thinks or thinks
+                    final_body = s_body or body
+                    if final_thinks:
+                        conversations.append(
+                            {"from": "gpt", "value": f"<think>\n{final_thinks[-1]}\n</think>\n{final_body}"}
+                        )
+                    else:
+                        conversations.append({"from": "gpt", "value": final_body})
+
+                    # Skip any trailing short ack PLANNER_RESPONSE right after send_message before next user turn
+                    while (
+                        j < n
+                        and steps[j].get("type") == "PLANNER_RESPONSE"
+                        and not steps[j].get("tool_calls")
+                    ):
+                        j += 1
+                    i = j
+                    continue
+
                 for idx, tc in enumerate(tool_calls):
                     t_name = str(tc.get("name") or "unknown_tool")
+                    if t_name == "send_message":
+                        continue
                     t_args = tc.get("args")
                     if isinstance(t_args, str):
                         try:
@@ -265,15 +313,14 @@ def parse_transcript(
                     if t_name not in used_tools:
                         used_tools.append(t_name)
 
-                    # Use explicit <think> from content if present; otherwise check subsequent final response or synthesize concise summary
+                    # Only use genuine model-emitted <think>; otherwise leave empty for Stage-2 model synthesis
                     if idx < len(thinks) and thinks[idx]:
-                        pre_think = thinks[idx]
+                        conversations.append(
+                            {"from": "gpt", "value": f"<think>\n{thinks[idx]}\n</think>\n"}
+                        )
                     else:
-                        pre_think = synthesize_concise_pre_tool_think(t_name, t_args)
+                        conversations.append({"from": "gpt", "value": ""})
 
-                    conversations.append(
-                        {"from": "gpt", "value": f"<think>\n{pre_think}\n</think>\n"}
-                    )
                     conversations.append(
                         {
                             "from": "function_call",
@@ -294,33 +341,27 @@ def parse_transcript(
                         }
                     )
 
-                # If the same step also contained a final answer body after tool calls (rare)
                 if body:
-                    post_think = thinks[-1] if thinks else "结合工具返回的信息整理得出最终回答。"
-                    conversations.append(
-                        {"from": "gpt", "value": f"<think>\n{post_think}\n</think>\n{body}"}
-                    )
+                    if len(thinks) > len(tool_calls):
+                        conversations.append(
+                            {"from": "gpt", "value": f"<think>\n{thinks[-1]}\n</think>\n{body}"}
+                        )
+                    else:
+                        conversations.append({"from": "gpt", "value": body})
 
                 i = j
                 continue
             else:
-                # Pure response or post-tool final response step
                 if raw_content:
                     if thinks:
-                        think_text = thinks[-1]
-                        final_body = body
+                        conversations.append(
+                            {
+                                "from": "gpt",
+                                "value": f"<think>\n{thinks[-1]}\n</think>\n{body}",
+                            }
+                        )
                     else:
-                        # No <think> tag found in final response -> preserve raw_content so auditor catches MISSING_THINK_IN_GPT
                         conversations.append({"from": "gpt", "value": raw_content})
-                        i += 1
-                        continue
-
-                    conversations.append(
-                        {
-                            "from": "gpt",
-                            "value": f"<think>\n{think_text}\n</think>\n{final_body}",
-                        }
-                    )
                 i += 1
                 continue
 
@@ -329,17 +370,63 @@ def parse_transcript(
     return conversations, used_tools, user_turns
 
 
+def check_prm_grounding(
+    conversations: List[Dict[str, str]],
+    gpt_idx: int,
+    think_text: str,
+) -> Tuple[bool, Optional[str]]:
+    """
+    Process Reward Model (PRM) grounding & consistency check:
+    Ensures the <think> text is contextually grounded in the surrounding trajectory
+    (e.g., references the tool, arguments, file/command, or task context) and is not
+    an empty or generic boilerplate string.
+    """
+    cleaned = think_text.strip()
+    if len(cleaned) < 12:
+        return False, f"THINK_TOO_SHORT(step={gpt_idx})"
+
+    next_msg = conversations[gpt_idx + 1] if gpt_idx + 1 < len(conversations) else None
+    if next_msg and next_msg.get("from") == "function_call":
+        try:
+            fc = json.loads(next_msg.get("value") or "{}")
+            t_name = str(fc.get("name") or "")
+            t_args = fc.get("arguments") or {}
+            # Check if think_text references either the tool concept, a parameter value token, or the preceding user request
+            candidate_anchors: List[str] = [t_name.lower()]
+            for v in t_args.values():
+                if isinstance(v, str) and len(v) >= 3:
+                    # Extract basename or key token
+                    tokens = re.findall(r"[A-Za-z0-9_\-\.]{3,}", v)
+                    candidate_anchors.extend(tok.lower() for tok in tokens[:4])
+            # Also collect tokens from the most recent human turn
+            for back_i in range(gpt_idx - 1, -1, -1):
+                if conversations[back_i].get("from") == "human":
+                    h_tokens = re.findall(r"[\w\-\.]{2,}", conversations[back_i].get("value", ""))
+                    candidate_anchors.extend(tok.lower() for tok in h_tokens[:8])
+                    break
+
+            low_think = cleaned.lower()
+            if candidate_anchors and not any(anchor in low_think for anchor in candidate_anchors if anchor):
+                return False, f"PRM_UNGROUNDED_PRE_TOOL_THINK(step={gpt_idx})"
+        except Exception:
+            pass
+
+    return True, None
+
+
 def audit_conversations(
     conversations: List[Dict[str, str]],
     expected_turns: int = 1,
-) -> Tuple[bool, List[str]]:
+) -> Tuple[bool, List[str], List[int]]:
     """
-    Validate ShareGPT conversation sequence, <think> coverage, and tool call JSON validity.
-    Returns (audit_passed, list_of_error_codes).
+    Validate ShareGPT conversation sequence, <think> presence, PRM grounding, and tool JSON validity.
+    Returns (audit_passed, list_of_error_codes, target_node_indices_needing_stage2).
     """
     errors: List[str] = []
+    target_nodes: List[int] = []
+
     if not conversations:
-        return False, ["EMPTY_CONVERSATION"]
+        return False, ["EMPTY_CONVERSATION"], []
 
     human_count = sum(1 for m in conversations if m.get("from") == "human")
     if human_count < expected_turns:
@@ -354,14 +441,18 @@ def audit_conversations(
             thinks, body = split_think_and_body(val)
 
             if "<think>" not in val or "</think>" not in val or not thinks:
+                target_nodes.append(idx)
                 if next_role == "function_call":
                     errors.append(f"MISSING_THINK_BEFORE_TOOL(step={idx})")
                 else:
                     errors.append(f"MISSING_THINK_IN_GPT(step={idx})")
             else:
                 for t in thinks:
-                    if len(t.strip()) < 10:
-                        errors.append(f"THINK_TOO_SHORT(step={idx})")
+                    ok, prm_err = check_prm_grounding(conversations, idx, t)
+                    if not ok and prm_err:
+                        errors.append(prm_err)
+                        if idx not in target_nodes:
+                            target_nodes.append(idx)
 
             if next_role != "function_call":
                 if not body.strip():
@@ -394,7 +485,59 @@ def audit_conversations(
     if conversations[-1].get("from") != "gpt":
         errors.append("CONVERSATION_MUST_END_WITH_GPT")
 
-    return len(errors) == 0, errors
+    return len(errors) == 0, errors, sorted(set(target_nodes))
+
+
+def profile_trajectory(
+    conversations: List[Dict[str, str]],
+    used_tools: List[str],
+    target_nodes: List[int],
+) -> Tuple[str, List[str]]:
+    """
+    Intelligently classify the Stage-1 trajectory and model guard/output behavior,
+    returning (profile_type, ordered_recommended_stage2_strategies).
+    """
+    if not target_nodes:
+        return "DIRECT_COMPLETE", []
+
+    gpt_indices = [i for i, m in enumerate(conversations) if m.get("from") == "gpt"]
+    native_think_count = sum(1 for i in gpt_indices if i not in target_nodes)
+    tool_call_count = sum(1 for m in conversations if m.get("from") == "function_call")
+
+    if native_think_count == 0:
+        profile = "STRICT_GUARDED_MINIMAL"
+    elif "run_command" in used_tools:
+        profile = "CLI_SYMBOLIC_EXECUTION"
+    elif len(used_tools) >= 2 or tool_call_count >= 3:
+        profile = "MULTI_HOP_TOOL_CHAIN"
+    else:
+        profile = "TOOL_SILENT_NATIVE"
+
+    return profile, list(STRATEGY_WATERFALL_BY_PROFILE[profile])
+
+
+def build_stage2_context(
+    conversations: List[Dict[str, str]],
+    target_nodes: List[int],
+) -> List[Dict[str, Any]]:
+    """Build a compact context view of the trajectory for the Stage-2 rationalizer agent."""
+    context_items: List[Dict[str, Any]] = []
+    for idx, msg in enumerate(conversations):
+        role = msg.get("from", "")
+        val = str(msg.get("value") or "")
+        if role == "observation" and len(val) > 1200:
+            val = val[:1200] + "...[truncated]"
+        item: Dict[str, Any] = {
+            "node_index": idx,
+            "from": role,
+            "needs_stage2_think": idx in target_nodes,
+            "value": val,
+        }
+        if role == "gpt" and idx in target_nodes:
+            next_role = conversations[idx + 1].get("from", "") if idx + 1 < len(conversations) else ""
+            item["node_type"] = "pre_tool_decision" if next_role == "function_call" else "post_observation_final_answer"
+        context_items.append(item)
+    return context_items
 
 
 def build_tools_json_string(
@@ -425,23 +568,30 @@ def build_tools_json_string(
     return json.dumps(tool_defs, ensure_ascii=False)
 
 
-def cmd_extract(args: argparse.Namespace) -> int:
+def cmd_inspect(args: argparse.Namespace) -> int:
     transcript_path = Path(args.transcript).resolve()
-    conversations, used_tools, user_turns = parse_transcript(
-        transcript_path, default_system=args.system
-    )
-    audit_passed, audit_errors = audit_conversations(
+    conversations, used_tools, user_turns = parse_transcript(transcript_path)
+    audit_passed, audit_errors, target_nodes = audit_conversations(
         conversations, expected_turns=args.expected_turns
+    )
+    profile_type, recommended_strategies = profile_trajectory(
+        conversations, used_tools, target_nodes
     )
     tools_str = build_tools_json_string(used_tools)
 
     payload = {
         "sample_id": args.sample_id,
+        "profile_type": profile_type,
+        "needs_stage2": len(target_nodes) > 0,
+        "target_node_indices": target_nodes,
+        "recommended_strategies": recommended_strategies,
+        "stage2_history": [],
         "audit_passed": audit_passed,
         "audit_errors": audit_errors,
         "completed_turns": user_turns,
         "expected_turns": args.expected_turns,
         "used_tools": used_tools,
+        "stage2_context": build_stage2_context(conversations, target_nodes),
         "sharegpt_record": {
             "system": args.system
             or "You are a helpful assistant capable of multi-turn reasoning and tool invocation.",
@@ -460,6 +610,10 @@ def cmd_extract(args: argparse.Namespace) -> int:
         json.dumps(
             {
                 "sample_id": args.sample_id,
+                "profile_type": profile_type,
+                "needs_stage2": len(target_nodes) > 0,
+                "target_node_indices": target_nodes,
+                "recommended_strategies": recommended_strategies,
                 "audit_passed": audit_passed,
                 "audit_errors": audit_errors,
                 "completed_turns": user_turns,
@@ -474,106 +628,207 @@ def cmd_extract(args: argparse.Namespace) -> int:
     return 0
 
 
+def parse_stage2_mapping(raw_text: str) -> Dict[str, str]:
+    """Extract JSON object mapping node_index -> rationale from Stage-2 agent output."""
+    text = raw_text.strip()
+    fence_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+    if fence_match:
+        text = fence_match.group(1).strip()
+    else:
+        brace_match = re.search(r"(\{.*\})", text, re.DOTALL)
+        if brace_match:
+            text = brace_match.group(1).strip()
+    obj = json.loads(text)
+    if not isinstance(obj, dict):
+        raise ValueError("Stage-2 output must be a JSON object mapping node_index -> think text.")
+    return {str(k): str(v).strip() for k, v in obj.items()}
+
+
+def cmd_merge_stage2(args: argparse.Namespace) -> int:
+    inspected_path = Path(args.inspected).resolve()
+    payload = json.loads(inspected_path.read_text(encoding="utf-8"))
+
+    stage2_path = Path(args.stage2_json).resolve()
+    raw_stage2 = stage2_path.read_text(encoding="utf-8")
+    mapping = parse_stage2_mapping(raw_stage2)
+
+    conversations: List[Dict[str, str]] = payload["sharegpt_record"]["conversations"]
+    updated_indices: List[int] = []
+
+    for k_str, rationale in mapping.items():
+        if not rationale:
+            continue
+        # Strip accidental outer <think> tags if the rationalizer included them
+        clean_rat = THINK_BLOCK_PATTERN.sub(r"\1", rationale).strip()
+        clean_rat = re.sub(r"^<think>\s*|\s*</think>$", "", clean_rat, flags=re.IGNORECASE).strip()
+        idx = int(k_str)
+        if 0 <= idx < len(conversations) and conversations[idx].get("from") == "gpt":
+            _, existing_body = split_think_and_body(conversations[idx].get("value", ""))
+            next_role = conversations[idx + 1].get("from", "") if idx + 1 < len(conversations) else ""
+            if next_role == "function_call" or not existing_body:
+                conversations[idx]["value"] = f"<think>\n{clean_rat}\n</think>\n"
+            else:
+                conversations[idx]["value"] = f"<think>\n{clean_rat}\n</think>\n{existing_body}"
+            updated_indices.append(idx)
+
+    expected_turns = int(payload.get("expected_turns", 1))
+    audit_passed, audit_errors, remaining_targets = audit_conversations(
+        conversations, expected_turns=expected_turns
+    )
+
+    payload["audit_passed"] = audit_passed
+    payload["audit_errors"] = audit_errors
+    payload["target_node_indices"] = remaining_targets
+    payload["needs_stage2"] = len(remaining_targets) > 0
+    payload["stage2_context"] = build_stage2_context(conversations, remaining_targets)
+    history = payload.setdefault("stage2_history", [])
+    history.append(
+        {
+            "strategy": args.strategy,
+            "updated_nodes": updated_indices,
+            "audit_passed": audit_passed,
+            "remaining_targets": remaining_targets,
+            "audit_errors": audit_errors,
+        }
+    )
+
+    out_path = Path(args.output or args.inspected).resolve()
+    with out_path.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+
+    print(
+        json.dumps(
+            {
+                "sample_id": payload.get("sample_id"),
+                "strategy_applied": args.strategy,
+                "updated_nodes": updated_indices,
+                "audit_passed": audit_passed,
+                "remaining_targets": remaining_targets,
+                "audit_errors": audit_errors,
+                "output_file": str(out_path),
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+    return 0
+
+
 def run_self_test() -> int:
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
+        # Test 1: Stage-1 transcript where native tool call step has NO inline <think>
+        # Verify that `inspect` does NOT fake <think>, profiles as CLI_SYMBOLIC_EXECUTION,
+        # and marks node 1 for Stage-2 synthesis!
         mock_transcript = tmp / "transcript_full.jsonl"
         steps = [
             {
                 "step_index": 0,
-                "source": "USER_EXPLICIT",
-                "type": "USER_INPUT",
+                "source": "SYSTEM",
+                "type": "SYSTEM_MESSAGE",
                 "status": "DONE",
-                "content": "[Task Execution]\n【用户第 1 轮提问】：\n请读取 plugin.json 并告诉我名称。",
+                "content": "<SYSTEM_MESSAGE>\n[Message] timestamp=2026-11-07T10:00:00Z sender=main priority=HIGH content=请统计 scripts 目录下各 Python 脚本的行数。\n</SYSTEM_MESSAGE>",
             },
             {
                 "step_index": 1,
                 "source": "MODEL",
                 "type": "PLANNER_RESPONSE",
                 "status": "DONE",
-                "content": "<think>\n需要读取当前目录下的 plugin.json 文件以查看插件名称。我将调用 read_file 工具读取该文件。\n</think>",
-                "tool_calls": [{"name": "read_file", "args": {"Path": "f:/zl/plugin.json"}}],
+                # Native tool call without inline content!
+                "tool_calls": [
+                    {
+                        "name": "run_command",
+                        "args": {
+                            "CommandLine": "Get-ChildItem scripts/*.py",
+                            "WaitMsBeforeAsync": 5000,
+                            "toolSummary": "Count script lines",
+                        },
+                    }
+                ],
             },
             {
                 "step_index": 2,
                 "source": "MODEL",
                 "type": "GENERIC",
                 "status": "DONE",
-                "content": '{"name": "agent-distiller", "version": "1.0.0"}',
+                "content": "task_manager.py: 260 lines\nsharegpt_writer.py: 210 lines",
             },
             {
                 "step_index": 3,
                 "source": "MODEL",
                 "type": "PLANNER_RESPONSE",
                 "status": "DONE",
-                "content": "<think>\n根据 read_file 返回的 JSON 内容，插件的 name 字段为 agent-distiller，版本号为 1.0.0。下面直接整理回答用户。\n</think>\n该插件的名称是 `agent-distiller`，版本为 `1.0.0`。",
-            },
-            {
-                "step_index": 4,
-                "source": "USER_EXPLICIT",
-                "type": "USER_INPUT",
-                "status": "DONE",
-                "content": "【用户第 2 轮追问】：\n它的版本号符合语义化版本规范吗？\n（提醒：若需调用工具，请先输出 <think>...</think>）",
-            },
-            {
-                "step_index": 5,
-                "source": "MODEL",
-                "type": "PLANNER_RESPONSE",
-                "status": "DONE",
-                "content": "<think>\n版本号 1.0.0 由主版本号、次版本号和修订号三部分组成，符合 SemVer 2.0.0 规范。\n</think>\n是的，`1.0.0` 严格遵循 MAJOR.MINOR.PATCH 的语义化版本（SemVer）规范。",
+                "content": "<think>\n根据 run_command 返回的行数统计结果，task_manager.py 为 260 行，sharegpt_writer.py 为 210 行，接下来直接汇总回答用户。\n</think>\n统计完成：`task_manager.py` 共 260 行，`sharegpt_writer.py` 共 210 行。",
             },
         ]
         mock_transcript.write_text(
             "\n".join(json.dumps(s, ensure_ascii=False) for s in steps) + "\n",
             encoding="utf-8",
         )
-        out_json = tmp / "extracted.json"
-        cmd_extract(
+        inspected_json = tmp / "inspected.json"
+        cmd_inspect(
             argparse.Namespace(
                 transcript=str(mock_transcript),
-                sample_id="test_001",
-                expected_turns=2,
+                sample_id="test_stage2_001",
+                expected_turns=1,
                 system="",
-                output=str(out_json),
+                output=str(inspected_json),
             )
         )
-        data = json.loads(out_json.read_text(encoding="utf-8"))
-        assert data["audit_passed"] is True, f"Audit failed: {data['audit_errors']}"
-        convs = data["sharegpt_record"]["conversations"]
-        assert len(convs) == 7
-        assert convs[0] == {"from": "human", "value": "请读取 plugin.json 并告诉我名称。"}
-        assert convs[1]["from"] == "gpt" and "<think>" in convs[1]["value"]
-        assert convs[2]["from"] == "function_call"
-        assert convs[3]["from"] == "observation"
-        assert convs[4]["from"] == "gpt" and "agent-distiller" in convs[4]["value"]
-        assert convs[5] == {"from": "human", "value": "它的版本号符合语义化版本规范吗？"}
-        assert convs[6]["from"] == "gpt" and "SemVer" in convs[6]["value"]
+        data = json.loads(inspected_json.read_text(encoding="utf-8"))
+        assert data["audit_passed"] is False
+        assert data["needs_stage2"] is True
+        assert data["target_node_indices"] == [1]
+        assert data["profile_type"] == "CLI_SYMBOLIC_EXECUTION"
+        assert data["recommended_strategies"][0] == "strategy_pot"
 
-        # Test negative audit case (missing <think>)
-        bad_convs = [
-            {"from": "human", "value": "你好"},
-            {"from": "gpt", "value": "未包含思考标签的直接回复"},
-        ]
-        passed, errs = audit_conversations(bad_convs, expected_turns=1)
-        assert passed is False and any("MISSING_THINK_IN_GPT" in e for e in errs)
+        # Test 2: Merge Stage-2 rationale produced by rationalizer subagent
+        stage2_out = tmp / "stage2_out.json"
+        stage2_out.write_text(
+            json.dumps(
+                {
+                    "1": "为了统计 scripts 目录下各 Python 脚本的代码行数，需要调用 run_command 执行 Get-ChildItem scripts/*.py 命令获取行数信息。"
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        cmd_merge_stage2(
+            argparse.Namespace(
+                inspected=str(inspected_json),
+                stage2_json=str(stage2_out),
+                strategy="strategy_pot",
+                output=str(inspected_json),
+            )
+        )
+        merged = json.loads(inspected_json.read_text(encoding="utf-8"))
+        assert merged["audit_passed"] is True, f"Expected pass, got: {merged['audit_errors']}"
+        assert merged["needs_stage2"] is False
 
-    print(json.dumps({"self_test": "PASSED", "module": "trajectory_extractor.py"}))
+    print(json.dumps({"self_test": "PASSED", "module": "trajectory_extractor.py (v2 two-stage)"}))
     return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Extract and audit ShareGPT trajectories from Antigravity subagent transcripts."
+        description="Two-stage trajectory inspector, adaptive profiler, Stage-2 merger & PRM auditor."
     )
     parser.add_argument("--self-test", action="store_true", help="Run built-in unit tests.")
     subparsers = parser.add_subparsers(dest="command")
 
-    p_ext = subparsers.add_parser("extract", help="Extract and audit a subagent transcript.")
-    p_ext.add_argument("--transcript", required=True, help="Path to transcript_full.jsonl or transcript.jsonl.")
-    p_ext.add_argument("--sample-id", required=True, help="Sample identifier.")
-    p_ext.add_argument("--expected-turns", type=int, default=1, help="Minimum expected human turns.")
-    p_ext.add_argument("--system", default="", help="Optional custom system prompt for ShareGPT output.")
-    p_ext.add_argument("--output", required=True, help="Output path for extracted JSON payload.")
+    for cmd_name in ("inspect", "extract"):
+        p_ins = subparsers.add_parser(cmd_name, help="Inspect Stage-1 transcript, profile behavior, and locate missing <think> nodes.")
+        p_ins.add_argument("--transcript", required=True, help="Path to transcript_full.jsonl or transcript.jsonl.")
+        p_ins.add_argument("--sample-id", required=True, help="Sample identifier.")
+        p_ins.add_argument("--expected-turns", type=int, default=1, help="Minimum expected human turns.")
+        p_ins.add_argument("--system", default="", help="Optional custom system prompt for ShareGPT output.")
+        p_ins.add_argument("--output", required=True, help="Output path for inspected JSON payload.")
+
+    p_merge = subparsers.add_parser("merge-stage2", help="Merge Stage-2 model-generated rationales and run PRM verification.")
+    p_merge.add_argument("--inspected", required=True, help="Path to inspected JSON payload.")
+    p_merge.add_argument("--stage2-json", required=True, help="Path to JSON file containing Stage-2 rationalizer output.")
+    p_merge.add_argument("--strategy", default="strategy_star", help="Name of Stage-2 strategy applied.")
+    p_merge.add_argument("--output", default="", help="Output path (defaults to overwriting --inspected).")
 
     return parser
 
@@ -583,8 +838,10 @@ def main() -> int:
     args = parser.parse_args()
     if args.self_test:
         return run_self_test()
-    if args.command == "extract":
-        return cmd_extract(args)
+    if args.command in ("inspect", "extract"):
+        return cmd_inspect(args)
+    if args.command == "merge-stage2":
+        return cmd_merge_stage2(args)
     parser.print_help()
     return 1
 
