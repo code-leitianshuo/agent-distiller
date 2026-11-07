@@ -501,6 +501,12 @@ def parse_transcript_with_clues(
                     elif not isinstance(t_args, dict):
                         t_args = {}
 
+                    # Normalize legacy view_file -> read_file for unified schema
+                    if t_name == "view_file":
+                        t_name = "read_file"
+                        if "AbsolutePath" in t_args:
+                            t_args = {"Path": t_args.pop("AbsolutePath"), **t_args}
+
                     if t_name not in used_tools:
                         used_tools.append(t_name)
 
@@ -525,7 +531,9 @@ def parse_transcript_with_clues(
                             ),
                         }
                     )
-                    obs_text = obs_steps[idx] if idx < len(obs_steps) else "Tool execution completed."
+                    obs_text = sanitize_observation_text(
+                        obs_steps[idx] if idx < len(obs_steps) else "Tool execution completed."
+                    )
                     conversations.append(
                         {
                             "from": "observation",
@@ -542,7 +550,7 @@ def parse_transcript_with_clues(
                         folded_summary_clues[node_idx] = raw_native
                     if len(thinks) > len(tool_calls):
                         conversations.append(
-                            {"from": "gpt", "value": f"<think>\n{thinks[-1]}\n</think>\n{body}"}
+                            {"from": "gpt", "value": f"<think>\n{thinks[-1]}\n</think>\n\n{sanitize_assistant_body(body)}"}
                         )
                     else:
                         conversations.append({"from": "gpt", "value": body})
@@ -584,16 +592,191 @@ HOST_SCAFFOLD_LEAK_TERMS = (
     "父agent",
     "parent agent",
     "父代理",
+    "主代理",
+    "向主代理",
     "后台执行",
     "等待系统通知",
     "临时磁盘空间不足",
     "c 盘空间不足",
+    "file:///",
 )
 
 SHALLOW_ANNOUNCEMENT_RE = re.compile(
-    r"^\s*(?:我将|脚本已写入|已将|已通过|已完成|现在通过|现在我将).*$",
+    r"^\s*(?:我将|脚本已写入|已将|已通过|已完成|现在通过|现在我将|目标：|结论：).*$",
     re.DOTALL,
 )
+
+CAUSAL_DERIVATION_MARKERS = (
+    "因为", "由于", "因此", "从而", "故", "推导", "计算", "代入", "公式", "方程",
+    "复杂度", "时间复杂度", "空间复杂度", "不变量", "契约", "定理", "引理", "解析",
+    "展开", "求导", "积分", "特征值", "矩阵", "向量", "遍历", "递归", "分治", "动态规划",
+)
+
+BOUNDARY_AND_HYPOTHESIS_MARKERS = (
+    "边界", "异常", "对比", "备选", "而非", "相比", "如果", "若", "假设", "验证",
+    "核对", "核验", "误差", "精度", "修正", "排查", "防止", "避免", "注意", "但是",
+    "然而", "不过", "退化", "奇异", "溢出", "容错", "回退", "一致", "守恒",
+)
+
+
+def sanitize_observation_text(raw_obs: str) -> str:
+    """Strip Antigravity host wrapper metadata (Created At/Completed At/File Path) and normalize line endings."""
+    if not raw_obs:
+        return ""
+    text = raw_obs.replace("\r\n", "\n").replace("\r", "\n")
+    # Strip Created At / Completed At headers
+    text = re.sub(
+        r"^Created At:\s*[^\n]+\nCompleted At:\s*[^\n]+\n",
+        "",
+        text,
+        flags=re.MULTILINE,
+    )
+    # Strip File Path: `file:///...` header from view_file/read_file
+    text = re.sub(
+        r"^File Path:\s*`?file:///[^`\n]+`?\nTotal Lines:\s*\d+\nTotal Bytes:\s*\d+\nShowing lines[^\n]+\n",
+        "",
+        text,
+        flags=re.MULTILINE,
+    )
+    return text.strip()
+
+
+def sanitize_assistant_body(raw_body: str) -> str:
+    """Strip Antigravity IDE proprietary file:/// markdown links while preserving readable code/symbol names."""
+    if not raw_body:
+        return ""
+    text = raw_body.replace("\r\n", "\n").replace("\r", "\n")
+    # Convert [`symbol`](file:///...) -> `symbol` and [filename](file:///...) -> `filename`
+    def _repl_link(m: re.Match) -> str:
+        label = m.group(1).strip()
+        if label.startswith("`") and label.endswith("`"):
+            return label
+        return f"`{label}`"
+    text = re.sub(r"\[([^\]]+)\]\(file:///[^\)]+\)", _repl_link, text)
+    return text.strip()
+
+
+def evaluate_implicit_reasoning_completeness(
+    conversations: List[Dict[str, str]],
+    gpt_idx: int,
+    think_text: str,
+    folded_clue: str = "",
+) -> Dict[str, Any]:
+    """
+    Strict 7-Gate Implicit Reasoning Completeness & Authenticity Judge.
+    Evaluates whether implicit reasoning (<think>) is completely extracted, deeply reasoned,
+    causally grounded in tools/observations, and free of host scaffolding or shallow plans.
+    Returns dict with `passed` (bool), `score` (0..100), `failed_gates` (List[str]), and `metrics`.
+    """
+    cleaned = think_text.strip()
+    failed_gates: List[str] = []
+    score = 100
+
+    next_msg = conversations[gpt_idx + 1] if gpt_idx + 1 < len(conversations) else None
+    prev_msg = conversations[gpt_idx - 1] if gpt_idx - 1 >= 0 else None
+    is_pre_tool = bool(next_msg and next_msg.get("from") == "function_call")
+    is_post_obs = bool(prev_msg and prev_msg.get("from") == "observation")
+
+    # Gate 1: Structural & Multi-Paragraph Depth Gate
+    paragraphs = [p.strip() for p in re.split(r"\n+", cleaned) if p.strip()]
+    min_chars = 320 if is_pre_tool else 360
+    if len(cleaned) < min_chars:
+        failed_gates.append(f"INSUFFICIENT_REASONING_VOLUME(step={gpt_idx},len={len(cleaned)},min={min_chars})")
+        score -= 25
+    if len(paragraphs) < 2:
+        failed_gates.append(f"SINGLE_PARAGRAPH_FLAT_THINK(step={gpt_idx},paras={len(paragraphs)})")
+        score -= 15
+
+    # Gate 2: Anti-Execution-Plan & Anti-Template Gate
+    if SHALLOW_ANNOUNCEMENT_RE.match(cleaned):
+        failed_gates.append(f"MECHANICAL_OR_SHALLOW_OPENING(step={gpt_idx})")
+        score -= 20
+    causal_hits = sum(1 for m in CAUSAL_DERIVATION_MARKERS if m in cleaned)
+    if causal_hits < 2:
+        failed_gates.append(f"LACKS_CAUSAL_DERIVATION_DEPTH(step={gpt_idx},hits={causal_hits})")
+        score -= 15
+
+    # Gate 3: Cognitive Self-Correction, Hypothesis Comparison & Boundary Gate
+    boundary_hits = sum(1 for m in BOUNDARY_AND_HYPOTHESIS_MARKERS if m in cleaned)
+    if boundary_hits < 2:
+        failed_gates.append(f"MISSING_HYPOTHESIS_OR_BOUNDARY_CHECK(step={gpt_idx},hits={boundary_hits})")
+        score -= 15
+
+    # Gate 4: Encrypted Thought Summary Clue Recall Gate (when L1 clue exists)
+    clue_recall = 1.0
+    if folded_clue:
+        clue_tokens = set(
+            tok.lower()
+            for tok in re.findall(r"[A-Za-z_][A-Za-z0-9_]{3,}|\d+\.\d+", folded_clue)
+            if tok.lower() not in {"thinking", "process", "understand", "goal", "user", "wants", "need", "step", "will", "that", "this", "with", "from", "have", "into"}
+        )
+        if clue_tokens:
+            low_think = cleaned.lower()
+            matched = sum(1 for tok in clue_tokens if tok in low_think)
+            clue_recall = matched / max(1, len(clue_tokens))
+            if len(clue_tokens) >= 4 and clue_recall < 0.25:
+                failed_gates.append(f"LOW_ENCRYPTED_CLUE_RECALL(step={gpt_idx},recall={clue_recall:.2f})")
+                score -= 15
+
+    # Gate 5: Tool Causal Grounding & Observation Verification Gate
+    low_think = cleaned.lower()
+    if is_pre_tool and next_msg:
+        try:
+            fc = json.loads(next_msg.get("value") or "{}")
+            t_name = str(fc.get("name") or "").lower()
+            t_args = fc.get("arguments") or {}
+            anchors = [t_name] if t_name else []
+            for v in t_args.values():
+                if isinstance(v, str):
+                    anchors.extend(tok.lower() for tok in re.findall(r"[A-Za-z0-9_\-\.]{3,}", v)[:6])
+            if anchors and not any(a in low_think for a in anchors if a):
+                failed_gates.append(f"PRM_UNGROUNDED_PRE_TOOL_THINK(step={gpt_idx})")
+                score -= 25
+        except Exception:
+            pass
+
+    if is_post_obs and prev_msg:
+        try:
+            obs_text = str(json.loads(prev_msg.get("value") or "{}").get("result") or "")
+            if obs_text.strip() == "Created file.":
+                obs_anchors = ["写入", "创建", "落盘", "生成", "编码", "脚本", "created", ".py"]
+            else:
+                obs_nums = re.findall(r"\b\d+(?:\.\d+)?\b", obs_text)
+                obs_ids = [
+                    w.lower()
+                    for w in re.findall(r"[A-Za-z_][A-Za-z0-9_]{3,}", obs_text)
+                    if w.lower() not in {"command", "exited", "with", "code", "output", "from", "import", "true", "false", "none", "self"}
+                ]
+                obs_anchors = [x.lower() for x in (obs_nums[:15] + obs_ids[:25])]
+            if obs_anchors and not any(a in low_think for a in obs_anchors if a):
+                failed_gates.append(f"MISSING_OBSERVATION_DATA_ANALYSIS(step={gpt_idx})")
+                score -= 20
+        except Exception:
+            pass
+
+    # Gate 6: Zero Host Scaffold Leak & Encoding Integrity Gate
+    for leak_term in HOST_SCAFFOLD_LEAK_TERMS:
+        if leak_term in low_think:
+            failed_gates.append(f"HOST_SCAFFOLD_LEAK_IN_THINK(step={gpt_idx},term={leak_term})")
+            score -= 30
+            break
+    if "\ufffd" in cleaned:
+        failed_gates.append(f"MOJIBAKE_FFFD_IN_THINK(step={gpt_idx})")
+        score -= 30
+
+    score = max(0, score)
+    return {
+        "passed": len(failed_gates) == 0 and score >= 85,
+        "score": score,
+        "failed_gates": failed_gates,
+        "metrics": {
+            "char_len": len(cleaned),
+            "paragraph_count": len(paragraphs),
+            "causal_marker_hits": causal_hits,
+            "boundary_marker_hits": boundary_hits,
+            "clue_recall": round(clue_recall, 3),
+        },
+    }
 
 
 def check_prm_grounding(
@@ -731,6 +914,10 @@ def audit_conversations(
                 obs_obj = json.loads(val)
                 if not isinstance(obs_obj, dict) or "result" not in obs_obj:
                     errors.append(f"INVALID_OBSERVATION_SCHEMA(step={idx})")
+                else:
+                    res_str = str(obs_obj.get("result") or "")
+                    if "\ufffd" in res_str:
+                        errors.append(f"MOJIBAKE_FFFD_IN_OBSERVATION(step={idx})")
             except Exception:
                 errors.append(f"INVALID_OBSERVATION_JSON(step={idx})")
 
@@ -905,10 +1092,12 @@ def build_auto_stage2_prompt(
     return (
         f"[Stage-2 Operator: {method_key} — {title}]\n"
         f"核心执行算子指令：{instruction}\n\n"
-        f"硬性约束：\n"
-        f"1. 若节点包含 `folded_thought_summary_clue`（底层加密思考区的第三人称英文折叠摘要线索），请将其与后续真实 `function_call` 参数及 `observation` 输出结合，还原为统一中文、第一人称的高密度 2~3 句推理摘要；\n"
-        f"2. 严禁以“我将…”、“脚本已写入…”、“已完成…”等空洞报幕句式开头，严禁出现 `send_message`、`父 Agent`、`后台执行` 等宿主调度词汇；\n"
-        f"3. 调用工具前节点需写明【问题/公式/状态拆解 + 工具名与关键参数构造依据】；收到 observation 后的总结节点需写明【observation 核心数值/输出核验 + 最终结论收敛】；\n"
+        f"硬性约束（严苛隐推理完整度标准）：\n"
+        f"1. 推理内容越多、越深、越详尽越好（每个节点至少 3 个自然段、400~900+ 字，严禁压缩为单段或 2~3 句简短摘要！）；\n"
+        f"2. 若节点包含 `folded_thought_summary_clue`（底层加密思考区的折叠摘要线索），必须 100% 吸收其中的全部数学公式、算法步骤、边界判断与符号锚点，并结合真实 `function_call` 与 `observation` 展开为第一人称纯中文深度心智演算；\n"
+        f"3. 工具调用前节点（pre_tool_decision）必须分段展开：① 底层机制/数学公式/代码架构建模；② 候选方案对比、边界条件排查与潜在反例/错误预防；③ 工具选型理由及每个关键参数/脚本逻辑的逐项构造推导；\n"
+        f"4. 观察结果后节点（post_observation_final_answer）必须分段展开：① 逐项核验 `observation` 返回的精确数值、状态与理论预期是否吻合；② 深入归因任何误差、报错、截断或高阶非线性效应；③ 综合多步证据收敛出最终结论结构；\n"
+        f"5. 严禁以“我将…”、“脚本已写入…”、“目标：”、“结论：”等机械报幕开头，严禁出现 `send_message`、`父 Agent`、`主代理`、`file:///` 等宿主脚手架词汇；\n"
         f"4. 对标记了 `needs_body_completion: true` 的节点 {needs_body_nodes}，请返回 `{{\"think\": \"...\", \"body\": \"完整 Markdown 最终回答\"}}`。\n\n"
         f"请针对待补全节点索引列表 {target_nodes}，基于以下第一阶段真实执行轨迹上下文生成 JSON 映射：\n\n"
         f"```json\n{compact_nodes}\n```\n\n"
@@ -1175,7 +1364,7 @@ def cmd_merge_stage2(args: argparse.Namespace) -> int:
             if next_role == "function_call" or not effective_body:
                 conversations[idx]["value"] = f"<think>\n{clean_rat}\n</think>\n"
             else:
-                conversations[idx]["value"] = f"<think>\n{clean_rat}\n</think>\n{effective_body}"
+                conversations[idx]["value"] = f"<think>\n{clean_rat}\n</think>\n\n{sanitize_assistant_body(effective_body)}"
             updated_indices.append(idx)
 
     expected_turns = int(payload.get("expected_turns", 1))

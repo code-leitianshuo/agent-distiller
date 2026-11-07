@@ -50,7 +50,7 @@ METHOD_CATALOG: List[Dict[str, Any]] = [
         "speedup": "1x",
         "when_to_use": "目标模型指令遵循良好、无强反蒸馏拒答（L0~L2），希望按统一认知结构输出直接推理步骤时使用。",
         "how_to_use": "在阶段一 SystemPrompt 或阶段二逆向补全中植入“目标识别 -> 前置条件核对 -> 直接执行动作”三段式元框架；CLI 指定 --select-methods M01。",
-        "stage2_instruction": "按【目标识别 -> 所需工具与前置条件核对 -> 直接执行动作或结论】三段式结构，合成 2~3 句高层推理摘要。",
+        "stage2_instruction": "按【目标识别 -> 所需工具与前置条件核对 -> 直接执行动作或结论】三段式结构，合成多段落、无删减的完整深度隐式推演链（涵盖问题底层机制建模、候选方案对比与边界排查、符号/公式预推演及工具参数逐项构造依据）。",
     },
     {
         "id": "M02",
@@ -65,8 +65,8 @@ METHOD_CATALOG: List[Dict[str, Any]] = [
         "latency_budget": "unconstrained",
         "speedup": "1x",
         "when_to_use": "模型默认跳过 <think> 直出结论或直调工具，但支持从给定的上下文起始前缀顺延续写时使用。",
-        "how_to_use": "为每个缺失思考的节点构造贴合上下文的首句前缀（如“为完成用户关于 X 的请求，需先调用工具 Y…”），顺势补全后续 1~2 句直接推导；CLI 指定 --select-methods M02。",
-        "stage2_instruction": "采用上下文预填充续写（Assistant Prefill）：先以贴合当前问题的起始引导句开头，顺势补全通向工具调用或结论的 2~3 句直接推理。",
+        "how_to_use": "为每个缺失思考的节点构造贴合上下文的首句前缀（如“为完成用户关于 X 的请求，需先调用工具 Y…”），顺势展开多段落完整心智演算（含前置条件核验、备选路径权衡与参数精确推导）；CLI 指定 --select-methods M02。",
+        "stage2_instruction": "采用上下文预填充续写（Assistant Prefill）：先以贴合当前问题的起始引导句开头，顺势展开通向工具调用或最终结论的多段落全量深度推理链（包含初始假设、边界条件检验、参数推导与观察验证）。",
     },
     {
         "id": "M03",
@@ -114,7 +114,7 @@ METHOD_CATALOG: List[Dict[str, Any]] = [
         "speedup": "1x",
         "when_to_use": "单次重构容易漏掉工具参数来源、出现逻辑跳步或未通过 check_prm_grounding 锚定校验时使用。",
         "how_to_use": "在阶段二执行“生成者起草 -> 审计员核查工具名与参数值出处 -> 合成器修正定稿”闭环；CLI 指定 --select-methods M05。",
-        "stage2_instruction": "采用生成-质询-修正（Critique & Refine）闭环：先拟定推导初稿，再核查每个工具名、文件路径和参数值是否均在上下文中有据可查，修正跳步后输出 2~3 句定稿。",
+        "stage2_instruction": "采用生成-质询-修正（Critique & Refine）闭环：先拟定推导初稿，再核查每个工具名、文件路径和参数值是否均在上下文中有据可查，补齐所有隐含逻辑跳步、边界反例排查与公式/参数推导细节后输出多段落完整定稿。",
     },
     {
         "id": "M06",
@@ -130,7 +130,7 @@ METHOD_CATALOG: List[Dict[str, Any]] = [
         "speedup": "1x",
         "when_to_use": "遭遇 L4 强反蒸馏护栏（对“输出内部思考过程”敏感拒答）或复杂多跳推理任务，需通过客观问答还原逻辑时使用。",
         "how_to_use": "完全规避“内部思考/心路历程”字眼，围绕“已知事实是什么 -> 缺失哪项数据 -> 哪个工具能提供”构建递进客观问答并浓缩为摘要；CLI 指定 --select-methods M06。",
-        "stage2_instruction": "采用苏格拉底子问题拆解法：围绕“当前已知什么事实、缺失什么关键信息、调用哪个工具及参数可补齐该信息”合成客观直接的 2~3 句推导摘要。",
+        "stage2_instruction": "采用苏格拉底子问题拆解法：围绕“当前已知什么事实、缺失什么关键信息、调用哪个工具及参数可补齐该信息”层层递进展开多段落完整心智推演（已知不变量剖析 -> 信息缺口与边界风险定位 -> 候选工具权衡与参数精确构造 -> 观察结果定量核验）。",
     },
     {
         "id": "M07",
@@ -212,7 +212,7 @@ METHOD_CATALOG: List[Dict[str, Any]] = [
         "speedup": "1x",
         "when_to_use": "目标模型在常规对话下触发 L4 强反蒸馏拒答或拒绝解释思考过程，但对软件工程接口契约、函数规约或代码注释完全放行时使用。",
         "how_to_use": "将阶段二任务表述为编写每个动作节点的输入前置条件（Precondition）、参数绑定规约与预期后置断言（Postcondition），再转化为紧凑 <think>；CLI 指定 --select-methods M11。",
-        "stage2_instruction": "采用代码与接口规约范式（Code/Specification Paradigm）：从软件工程接口契约视角，写明该节点的输入前置状态、工具参数绑定依据与预期输出断言（2~3 句）。",
+        "stage2_instruction": "采用代码与接口规约范式（Code/Specification Paradigm）：从软件工程接口契约视角，完整推演该节点的输入前置契约、类型/边界不变量、工具参数绑定推导过程与后置输出断言（多段落详尽展开）。",
     },
     {
         "id": "M12",
@@ -244,7 +244,7 @@ METHOD_CATALOG: List[Dict[str, Any]] = [
         "speedup": "1-1.5x",
         "when_to_use": "旗舰大模型输出极度跳跃或开启强思考隐藏，需要借助同家族更开放的轻量/中量级子 Agent 实例展开可读中间步骤时使用。",
         "how_to_use": "阶段一用旗舰模型采集高准确度工具动作轨迹，阶段二拉起指定 Model='flash' 或同族辅助子 Agent 对齐展开适配学生容量的推理摘要；CLI 指定 --select-methods M13。",
-        "stage2_instruction": "采用跨尺寸师生对齐转录：严格锁定阶段一教师产出的真实工具调用与结论，展开为适合轻量学生模型学习的清晰、直接的 2~3 句推导步骤。",
+        "stage2_instruction": "采用跨尺寸师生对齐转录：严格锁定阶段一教师产出的真实工具调用与结论，将跳跃的隐式直觉完整展开为零跳步、多段落的详尽推导步骤（含原理铺垫、中间计算、备选排除与参数映射），供学生模型完整学习。",
     },
     {
         "id": "M14",
@@ -291,8 +291,8 @@ METHOD_CATALOG: List[Dict[str, Any]] = [
         "latency_budget": "moderate",
         "speedup": "1-1.5x",
         "when_to_use": "需要根据每步工具命令复杂度、observation 字节长度或接口返回的 reasoning_tokens 元数据，精准控制各节点 <think> 信息密度时使用。",
-        "how_to_use": "自动计算每步工具参数与返回载荷规模，为简单步分配 1~2 句精炼预算、为复杂多参数步分配 2~3 句完整预算；CLI 指定 --select-methods M16。",
-        "stage2_instruction": "采用复杂度预算预言机校准：根据当前步骤的工具参数复杂度与返回数据量，严格在 2~3 句高密度预算内完整交代工具名、关键参数与观察结论。",
+        "how_to_use": "自动计算每步工具参数与返回载荷规模，按任务信息熵动态扩容推理深度，确保每个决策节点均包含完整的多段落机制拆解、候选方案比选与参数/数据定量核验；CLI 指定 --select-methods M16。",
+        "stage2_instruction": "采用复杂度预算预言机校准：根据当前步骤的工具参数复杂度与返回数据量，以最大化有效推理密度为目标，多段落完整交代问题建模、候选方案权衡、工具参数逐项推导及观察结果定量核验。",
     },
 
     # ==================== D03: M17 - M24 ====================
@@ -358,7 +358,7 @@ METHOD_CATALOG: List[Dict[str, Any]] = [
         "speedup": "1-1.5x",
         "when_to_use": "同领域批量蒸馏（如全量做代码静态审计、Git 历史检查或 Schema 校验），希望复用高可靠领域元推理结构时使用。",
         "how_to_use": "匹配当前任务领域的标准元推理槽位（目标实体 -> 工具操作 -> 校验指标），填入当前样本的真实文件名与参数；CLI 指定 --select-methods M20。",
-        "stage2_instruction": "采用思维缓冲区（Buffer-of-Thoughts）领域元模板：按照【定位目标文件/命令 -> 映射工具参数 -> 提炼返回指标】的标准工程结构合成 2~3 句摘要。",
+        "stage2_instruction": "采用思维缓冲区（Buffer-of-Thoughts）领域元模板：按照【底层问题与架构契约剖析 -> 候选方案权衡与边界条件排查 -> 工具选型与参数/脚本精确构造 -> 观察指标定量核验】的四段式工程结构展开完整深度推演。",
     },
     {
         "id": "M21",
@@ -421,8 +421,8 @@ METHOD_CATALOG: List[Dict[str, Any]] = [
         "latency_budget": "unconstrained",
         "speedup": "1x",
         "when_to_use": "专门针对 L1_SUMMARY_FOLDED（模型仅输出过短的一句话摘要或直接给出结论），需将浓缩摘要反演还原为清晰的直接步骤时使用。",
-        "how_to_use": "以已有的简短摘要或回答首句为反演锚点，结合输入问题与工具返回数据，展开为 2~3 句具体执行与推导步骤；CLI 指定 --select-methods M24。",
-        "stage2_instruction": "采用轨迹反演展开（TIA Trajectory Inversion）：从已有的简短结论或观察摘要出发，逆向反演展开出支撑该结论成立的 2~3 句直接推导步骤。",
+        "how_to_use": "以已有的简短摘要或回答首句为反演锚点，结合输入问题与工具返回数据，逆向反演重构出多段落、无删减的完整第一人称心智演算全过程（包含底层加密摘要中的所有推导锚点、中间试错与公式/代码细节）；CLI 指定 --select-methods M24。",
+        "stage2_instruction": "采用轨迹反演展开（TIA Trajectory Inversion）：从已有的简短结论或观察摘要出发，结合底层加密思维摘要线索（folded_thought_summary_clue）与真实工具执行轨迹，逆向反演重构出支撑该动作或结论成立的多段落、全量第一人称深度推演过程。",
     },
 
     # ==================== D04: M25 - M31 ====================
@@ -554,7 +554,7 @@ METHOD_CATALOG: List[Dict[str, Any]] = [
         "speedup": "2-4x",
         "when_to_use": "拥有开源教师与学生模型权重（--open-source true），希望学生在关键工具决策词元位置直接对齐教师的中间层高维连续激活时使用。",
         "how_to_use": "1. 用本插件生成 ShareGPT 轨迹；2. 在师生等比例层（如 1/4, 2/4, 3/4, 1 深度）挂载线性投影层 W_proj；3. 在 </think> 与 function_call 起始词元处最小化 MSE + Cosine 损失；CLI 指定 --open-source true --select-methods M32。",
-        "stage2_instruction": "生成结构规整的 2~3 句推理摘要，为白盒隐藏层激活对齐提供精确的 </think> 边界锚点。",
+        "stage2_instruction": "生成多段落、结构层次分明的完整深度推理链，为白盒隐藏层激活对齐提供精确的 </think> 边界锚点。",
     },
     {
         "id": "M33",
@@ -586,7 +586,7 @@ METHOD_CATALOG: List[Dict[str, Any]] = [
         "speedup": "4-8x",
         "when_to_use": "拥有经本插件蒸馏出的分步显式 <think> 数据集，希望将学生模型的自然语言思考逐步内化为 K 个连续隐思维向量以实现 4~8 倍加速时使用。",
         "how_to_use": "1. 使用本插件导出带分句 <think> 的 ShareGPT 数据集；2. 按课程学习分阶段将每句显式推导替换为 <bot>...<eot> 之间的最后一层连续隐状态直传（h_t 直接作为 t+1 输入嵌入）；CLI 指定 --open-source true --select-methods M34。",
-        "stage2_instruction": "将每步 <think> 拆分为 2~3 个逻辑层次清晰的独立短句，以便在 Coconut 课程训练中按句逐步替换为连续隐向量。",
+        "stage2_instruction": "将每步 <think> 拆分为 3~5 个逻辑递进、边界分明的独立推演段落（问题建模段、候选对比与边界排查段、公式/代码符号推导段、参数映射或数据核验段），以便在 Coconut 课程训练中按句逐步替换为连续隐向量。",
     },
     {
         "id": "M35",
@@ -602,7 +602,7 @@ METHOD_CATALOG: List[Dict[str, Any]] = [
         "speedup": "5-10x",
         "when_to_use": "希望免除多阶段课程学习，在单阶段内让同一模型通过自我蒸馏将长思维链压缩为固定 M=4~8 个连续隐词元时使用。",
         "how_to_use": "同一模型并行前向运行 ShareGPT 显式 <think> 教师分支与 M 个连续隐词元学生分支，在工具调用/答案生成前夕词元位置施加 Smooth-L1 隐状态对齐损失；CLI 指定 --open-source true --select-methods M35。",
-        "stage2_instruction": "生成高信息密度的 2~3 句显式推理摘要，作为 CODI 自我蒸馏教师分支的监督信号。",
+        "stage2_instruction": "生成高信息密度、多段落无删减的完整显式推理链，作为 CODI 自我蒸馏教师分支的监督信号。",
     },
     {
         "id": "M36",
@@ -618,7 +618,7 @@ METHOD_CATALOG: List[Dict[str, Any]] = [
         "speedup": "4-8x",
         "when_to_use": "单纯使用 Coconut 或 CODI 压缩后出现隐空间语义坍缩（不同连续隐词元表征趋同、丧失步骤区分度）时使用。",
         "how_to_use": "在训练期挂载轻量步级解码器（推理期移除），强制第 k 个连续隐词元必须能解码还原出本插件 ShareGPT 数据集中对应的第 k 句 <think> 文本；CLI 指定 --open-source true --select-methods M36。",
-        "stage2_instruction": "确保每步 <think> 由语义正交、信息不重叠的 2~3 句组成，供 SIM-CoT 步级解码器逐句对齐监督。",
+        "stage2_instruction": "确保每步 <think> 由语义正交、层层递进的 3~5 个深度推演段落组成，供 SIM-CoT 步级解码器逐句对齐监督。",
     },
     {
         "id": "M37",
@@ -634,7 +634,7 @@ METHOD_CATALOG: List[Dict[str, Any]] = [
         "speedup": "3-6x",
         "when_to_use": "希望将教师沿时间步横向展开的推理过程，压缩映射到学生沿网络层深度纵向演化的激活中，并拟合多分支多峰分布时使用。",
         "how_to_use": "按时空对角线采样教师第 t 步第 l 层隐状态对齐至学生更深层激活，并用混合高斯模型（GMM）负对数似然损失替代单一 MSE；CLI 指定 --open-source true --select-methods M37。",
-        "stage2_instruction": "按递进深度组织 2~3 句推理摘要，支撑时空对角线跨层映射。",
+        "stage2_instruction": "按由浅入深的认知递进层次组织多段落完整推理链，支撑时空对角线跨层映射。",
     },
     {
         "id": "M38",
@@ -782,7 +782,7 @@ METHOD_CATALOG: List[Dict[str, Any]] = [
         "speedup": "5-12x",
         "when_to_use": "学生模型采用权重复用的循环深度架构（Looped Transformer / Huginn），希望不增加词元序列长度、仅沿深度轴循环迭代复现高阶推理时使用。",
         "how_to_use": "将教师长思维链的分步演化轨迹映射为学生共享层块的 R 次深度循环迭代，按展开步渐进对齐隐状态；CLI 指定 --open-source true --select-methods M46。",
-        "stage2_instruction": "将推理过程组织为递进收敛的 2~3 个阶段性步骤，适配循环深度展开映射。",
+        "stage2_instruction": "将推理过程组织为【初始建模与假设 -> 边界排查与候选修正 -> 精确计算与收敛验证】的多段落递进结构，适配循环深度展开映射。",
     },
     {
         "id": "M47",
@@ -814,7 +814,7 @@ METHOD_CATALOG: List[Dict[str, Any]] = [
         "speedup": "3-10x",
         "when_to_use": "希望学生模型根据当前词元/动作难度自适应分配算力（简单语法词元 1~2 步早退，复杂工具参数词元多步迭代）时使用。",
         "how_to_use": "监控相邻深度迭代步预测分布的相对 KL 散度 KL(p_t || p_{t-1})，迁移教师的步级收敛早退阈值判据；CLI 指定 --open-source true --select-methods M48。",
-        "stage2_instruction": "按步骤实际复杂度精简推导：简单步骤 1~2 句直接给出依据，复杂多跳步骤写明 2~3 句完整判据。",
+        "stage2_instruction": "按步骤复杂度充分展开多段落推导：完整写明底层判据、备选方案排除理由、参数构造逻辑及观察数据验证过程。",
     },
     {
         "id": "M49",
@@ -829,8 +829,8 @@ METHOD_CATALOG: List[Dict[str, Any]] = [
         "latency_budget": "low_latency",
         "speedup": "1-5x",
         "when_to_use": "黑盒场景下需在复杂工具调用前设立结构化决策检查点；或白盒标准架构中插入可学习 <pause> 词元横向扩展 KV 算力列时使用。",
-        "how_to_use": "黑盒模式：按【目标锚点 -> 参数依据锚点 -> 执行决策锚点】生成 2~3 句紧凑摘要；白盒模式：在工具调用前插入 P 个 <pause> 词元并对齐其多层 KV 激活；CLI 指定 --select-methods M49。",
-        "stage2_instruction": "采用 Pause-Anchor 检查点锚定：按【目标确认点 -> 工具与参数映射点 -> 执行/结论收敛点】生成紧凑的 2~3 句推理摘要。",
+        "how_to_use": "黑盒模式：按【问题建模锚点 -> 候选权衡与边界检验锚点 -> 参数/公式推导锚点 -> 执行/核验收敛锚点】生成多段落完整推演；白盒模式：在工具调用前插入 P 个 <pause> 词元并对齐其多层 KV 激活；CLI 指定 --select-methods M49。",
+        "stage2_instruction": "采用 Pause-Anchor 检查点锚定：按【问题建模检查点 -> 备选路径排除与边界排查点 -> 工具参数/公式逐项推导点 -> 观察数据核验收敛点】生成多段落深度推演。",
     },
 
     # ==================== D08: M50 - M54 ====================
@@ -880,7 +880,7 @@ METHOD_CATALOG: List[Dict[str, Any]] = [
         "speedup": "3-8x",
         "when_to_use": "希望模型自主学会将繁琐中间计算内化至连续隐状态、仅将最关键的高层决策摘要外显为离散文本时使用。",
         "how_to_use": "采用混合离散-连续动作空间强化学习（HRPO），联合优化终端任务奖励与显式词元长度成本；CLI 指定 --open-source true --select-methods M52。",
-        "stage2_instruction": "仅外显最核心的 2~3 句高层决策主干，省略繁琐的底层逐字演算细节。",
+        "stage2_instruction": "完整外显从高层策略建模、候选方案比选到底层符号/公式演算与参数构造的全链路推理细节。",
     },
     {
         "id": "M53",
@@ -961,8 +961,8 @@ METHOD_CATALOG: List[Dict[str, Any]] = [
         "latency_budget": "unconstrained",
         "speedup": "1x",
         "when_to_use": "单一视角生成的推理摘要不够全面，希望融合“用户意图拆解”与“工具参数符号映射”两条演化路径并剪除冗余时使用。",
-        "how_to_use": "在阶段二对目标节点执行双路径交叉重组与变异修补，合成逻辑密度超越单一视角的 2~3 句超集推理摘要；CLI 指定 --select-methods M57。",
-        "stage2_instruction": "采用 CoT-Evo 演化交叉融合：融合【任务意图分析】与【工具参数符号推导】两条路径的优点，剪除冗余套话后合成 2~3 句高密度摘要。",
+        "how_to_use": "在阶段二对目标节点执行双路径交叉重组与变异修补，合成兼顾全局架构意图、边界反例排查与底层符号/参数推导的多段落超集深度推理链；CLI 指定 --select-methods M57。",
+        "stage2_instruction": "采用 CoT-Evo 演化交叉融合：融合【任务意图分析】与【工具参数符号推导】两条路径的优点，剔除空洞报幕套话，深度融合多段落的机制剖析、备选对比、公式/AST 推导与数据核验。",
     },
     {
         "id": "M58",
@@ -978,7 +978,7 @@ METHOD_CATALOG: List[Dict[str, Any]] = [
         "speedup": "1x",
         "when_to_use": "需要将来自用户提问、工具 Schema 定义以及真实 observation 返回值的多源实体无缝嫁接为连贯推理摘要时使用。",
         "how_to_use": "提取问题实体、工具参数键名与观察返回指标三方共识，按时间步嫁接合并；CLI 指定 --select-methods M58。",
-        "stage2_instruction": "采用 Merge-of-Thought 多源嫁接：将用户提问中的目标实体、所调工具的参数名称以及观察结果中的关键数据无缝合并为 2~3 句连贯推导。",
+        "stage2_instruction": "采用 Merge-of-Thought 多源嫁接：将用户提问中的目标实体、所调工具的参数名称以及观察结果中的关键数据无缝融合为多段落、逻辑严密的全链路深度推演。",
     },
     {
         "id": "M59",
@@ -994,7 +994,7 @@ METHOD_CATALOG: List[Dict[str, Any]] = [
         "speedup": "1.5-2x",
         "when_to_use": "原始思考过程过长、包含无效反复试探或空洞寒暄，需要剪枝提纯为精炼的高层直接步骤摘要时使用。",
         "how_to_use": "剥离一切重复铺垫、无效分支与事后总结套话，仅保留通向工具调用或最终结论的最短因果主干；CLI 指定 --select-methods M59。",
-        "stage2_instruction": "采用 DLCoT 去冗余结构剪枝：剔除一切寒暄套话与无效分支，仅用 2~3 句最精炼的语言陈述通向工具动作或最终回答的直接因果主干。",
+        "stage2_instruction": "采用 DLCoT 去冗余结构剪枝：剔除一切寒暄套话与无效分支，剔除一切空洞的报幕式套话与宿主脚手架噪声，保留并深化所有实质性的原理推导、候选方案对比、边界条件检验、工具参数构造及观察数据核验（多段落高密度展开）。",
     },
 
     # ==================== D10: M60 - M62 ====================
@@ -1012,7 +1012,7 @@ METHOD_CATALOG: List[Dict[str, Any]] = [
         "speedup": "1x",
         "when_to_use": "轨迹中包含 run_command、Python 单行脚本、Git 命令或数值统计，推理过程必须与实际执行的命令行代码和标准输出严格锚定时使用。",
         "how_to_use": "提取 function_call 中的真实命令字符串、参数标志与 observation 标准输出，生成严格锚定命令语法与执行结果的符号级推理摘要；CLI 指定 --select-methods M60。",
-        "stage2_instruction": "采用 PoT 程序与命令执行证据锚定：严格围绕实际执行的命令字符串、脚本路径、参数标志及标准输出数据生成 2~3 句直接推导摘要。",
+        "stage2_instruction": "采用 PoT 程序与命令执行证据锚定：严格围绕实际执行的命令字符串、脚本路径、参数标志及标准输出数据展开多段落深度推演：详述算法/数学原理建模、代码数据结构与控制流设计、边界异常处理及命令输出数值的逐项核验。",
     },
     {
         "id": "M61",
@@ -1043,8 +1043,8 @@ METHOD_CATALOG: List[Dict[str, Any]] = [
         "latency_budget": "unconstrained",
         "speedup": "1x",
         "when_to_use": "多轮复杂任务中同时涉及“用户意图演进”、“当前工作区环境状态”与“工具接口契约”三重正交约束时使用。",
-        "how_to_use": "黑盒模式：依次从意图视角、环境状态视角、工具参数视角正交合成 2~3 句推理摘要；白盒模式：配合 Poly-Encoder 提取三视角独立向量融合监督；CLI 指定 --select-methods M62。",
-        "stage2_instruction": "采用 MPCoT 多视角正交分解：依次从【用户当前意图】、【工作区已知环境状态】与【所调工具参数契约】三个正交维度合成 2~3 句紧凑推导。",
+        "how_to_use": "黑盒模式：依次从意图视角、环境状态视角、工具参数视角正交展开多段落深度推演（意图与数学/工程建模段 + 环境状态与边界约束排查段 + 工具选型与参数/算法精确推导段）；白盒模式：配合 Poly-Encoder 提取三视角独立向量融合监督；CLI 指定 --select-methods M62。",
+        "stage2_instruction": "采用 MPCoT 多视角正交分解：依次从【用户当前意图】、【工作区已知环境状态】与【所调工具参数契约】三个正交维度分段展开详尽、无删减的深度推演。",
     },
 
     # ==================== D11: M63 - M64 ====================
@@ -1095,8 +1095,8 @@ METHOD_CATALOG: List[Dict[str, Any]] = [
         "latency_budget": "moderate",
         "speedup": "1x",
         "when_to_use": "需要根据子 Agent 每步的 created_at 时间跨度与 observation 载荷大小，自动区分“直觉快步”与“深度重算步”并匹配对应推理详略度时使用。",
-        "how_to_use": "解析日志中相邻步骤耗时差与 observation 字节量，对高耗时/大载荷关键步生成包含完整参数与数据核验的 2~3 句摘要，对轻量步保持 1~2 句精炼推导；CLI 指定 --select-methods M65。",
-        "stage2_instruction": "采用延迟与载荷复杂度校准：根据每个节点的工具载荷规模动态适配详略度，关键复杂步完整写明参数与数据依据（2~3 句），简单步保持极简（1~2 句）。",
+        "how_to_use": "解析日志中相邻步骤耗时差与 observation 字节量，对所有节点均展开多段落完整推演，在高耗时/大载荷关键步进一步深化公式推导、中间状态验算与全量输出指标比对；CLI 指定 --select-methods M65。",
+        "stage2_instruction": "采用延迟与载荷复杂度校准：根据每个节点的工具载荷规模动态适配详略度，确保每一步均具备多段落的机制分析、候选权衡、参数推导与结果核验，关键复杂步进一步展开完整数学/代码演算细节。",
     },
     {
         "id": "M66",
@@ -1112,7 +1112,7 @@ METHOD_CATALOG: List[Dict[str, Any]] = [
         "speedup": "1x",
         "when_to_use": "在 Antigravity 宿主环境下运行子 Agent 后，需从本地 .system_generated/logs/transcript_full.jsonl 无损提取对话、工具调用、观察结果与原生外显 <think> 时使用。",
         "how_to_use": "默认内置于 trajectory_extractor.py inspect，自动合并 send_message 与 PLANNER_RESPONSE 中的外显 <think>，仅对缺失节点触发阶段二精准补全；CLI 亦可显式指定 --select-methods M66。",
-        "stage2_instruction": "在保留本地会话日志已有原生外显 <think> 的基础上，为剩余缺失节点补全风格一致、上下文无缝衔接的 2~3 句高层推理摘要。",
+        "stage2_instruction": "在保留本地会话日志已有原生外显 <think> 的基础上，为剩余缺失节点结合底层加密摘要线索与真实工具轨迹，补全风格一致、多段落深度展开的全量第一人称心智推演链。",
     },
 ]
 
