@@ -189,6 +189,8 @@ def cmd_init(args: argparse.Namespace) -> int:
             **seed,
             "status": "pending",
             "retry_count": 0,
+            "access_tier": "blackbox",
+            "guard_level": "UNPROFILED",
             "profile_type": "UNPROFILED",
             "recommended_strategies": list(DEFAULT_STAGE2_WATERFALL),
             "tried_strategies": [],
@@ -258,6 +260,12 @@ def cmd_update_status(args: argparse.Namespace) -> int:
         history = entry.setdefault("subagent_history", [])
         if args.subagent_id not in history:
             history.append(args.subagent_id)
+
+    if getattr(args, "access_tier", None):
+        entry["access_tier"] = args.access_tier
+
+    if getattr(args, "guard_level", None):
+        entry["guard_level"] = args.guard_level
 
     if args.profile_type:
         entry["profile_type"] = args.profile_type
@@ -380,6 +388,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_upd.add_argument("--diagnosis", default=None, help="Audit diagnosis or error reason.")
     p_upd.add_argument("--subagent-id", default=None, help="Sub-agent conversation ID used.")
+    p_upd.add_argument("--access-tier", default=None, help="Model access tier (whitebox/greybox/blackbox).")
+    p_upd.add_argument("--guard-level", default=None, help="Classified guard level (L0..L4).")
     p_upd.add_argument("--profile-type", default=None, help="Classified Stage-1 profile type.")
     p_upd.add_argument("--recommended-strategies", default=None, help="Comma-separated strategy waterfall.")
     p_upd.add_argument("--strategy-tried", default=None, help="Stage-2 strategy name just attempted.")

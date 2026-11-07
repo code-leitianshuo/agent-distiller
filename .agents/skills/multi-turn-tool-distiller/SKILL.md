@@ -37,7 +37,10 @@ description: >-
 | `execution_mode` | `serial` \| `parallel` | `serial` | 串行逐条执行，或按 `batch_size` 并行拉起多个独立 Sub-Agent |
 | `batch_size` | 整数 (`1`~`5`) | `3` | `parallel` 模式下的并发 Sub-Agent 数量 |
 | `turns_range` | `min-max`（如 `2-4`） | `2-4` | 每条样本的多轮对话总轮数 |
-| `max_retries` | 整数 | `5` | 阶段二算子回退尝试的最大次数（对应 5 种算子瀑布流） |
+| `open_source` | `true` \| `false` | `false` | 目标模型是否开源（若为 `true` 自动激活 `whitebox` 隐空间/循环深度后训练配方） |
+| `access_tier` | `auto` \| `whitebox` \| `greybox` \| `blackbox` | `auto` | 模型访问层级：开源权重(`whitebox`)、对数概率/投机预言机(`greybox`)、纯黑盒接口(`blackbox`) |
+| `guard_level` | `auto` \| `L0` \| `L1` \| `L2` \| `L3` \| `L4` | `auto` | 防护等级：支持由 `inspect` 根据阶段一输出自动识别或手动指定 |
+| `max_retries` | 整数 | `5` | 阶段二算子回退尝试的最大次数（从 12 算子瀑布流中依次切换） |
 | `output_file` | 文件路径字符串 | `datasets/sharegpt_train.jsonl` | 纯净 ShareGPT 输出路径（同目录维护 `.state.json` 与 `failed.jsonl`） |
 
 ---
@@ -90,21 +93,24 @@ description: >-
 
 ---
 
-### Step 4：智能画像诊断与阶段二（Stage 2）五级算子回退重构
+### Step 4：智能三维画像（开源属性 × 防护等级 × 领域特征）与阶段二 12 算子回退重构
 
-1. **运行 `inspect` 进行轨迹画像与缺失诊断**：
+1. **运行 `inspect` 进行三维画像与缺失诊断**（完整分类体系见 [method_taxonomy.md](./references/method_taxonomy.md)）：
    ```powershell
    python skills/multi-turn-tool-distiller/scripts/trajectory_extractor.py inspect `
      --transcript "<appDataDir>/brain/<stage1_subagent_id>/.system_generated/logs/transcript_full.jsonl" `
      --sample-id "<sample_id>" `
      --expected-turns <target_turns> `
+     --open-source <true|false> `
+     --access-tier <auto|whitebox|greybox|blackbox> `
+     --guard-level <auto|L0|L1|L2|L3|L4> `
      --output "datasets/tmp_<sample_id>.json"
    ```
-   脚本会输出：
-   - `profile_type`：模型行为画像（如 `DIRECT_COMPLETE`、`TOOL_SILENT_NATIVE`、`CLI_SYMBOLIC_EXECUTION`、`MULTI_HOP_TOOL_CHAIN`、`STRICT_GUARDED_MINIMAL`）；
-   - `needs_stage2`：布尔值，指示是否存在缺失 `<think>` 的步骤或未通过 PRM 过程一致性校验的节点；
-   - `target_node_indices`：需要阶段二模型生成/重构 `<think>` 的具体节点索引列表；
-   - `recommended_strategies`：按智能画像排序的阶段二回退算子队列（如 `["strategy_pot", "strategy_star", "strategy_mpcot", "strategy_cotevo", "strategy_prefill"]`）。
+   脚本会自动输出：
+   - `access_tier` & `post_training_recipe`：根据是否开源/权限层级，匹配 **Coconut / CODI / SIM-CoT / KaVa / PCCoT / OPLD / EqR / SoftCoT**（开源白盒）、**Top-K Logits KL / DoLa / OSKD / MARCOS**（半开源灰盒）或纯黑盒轨迹微调方案；
+   - `guard_level`：自动识别防护等级（`L0_UNRESTRICTED`、`L1_SUMMARY_FOLDED`、`L2_TOOL_SILENT`、`L3_ENCRYPTED_STATE`、`L4_STRICT_ANTI_DISTILL`）；
+   - `profile_type`：轨迹特征（`DIRECT_COMPLETE`、`TOOL_SILENT_NATIVE`、`CLI_SYMBOLIC_EXECUTION`、`MULTI_HOP_TOOL_CHAIN`、`STRICT_GUARDED_MINIMAL`）；
+   - `recommended_strategies`：从 [prompt_strategies.md](./references/prompt_strategies.md) 的 **12 个可执行重构算子**（`strategy_star`、`strategy_mpcot`、`strategy_pot`、`strategy_cotevo`、`strategy_prefill`、`strategy_tia`、`strategy_mcts`、`strategy_debate`、`strategy_socratic`、`strategy_code_paradigm`、`strategy_prm_rerank`、`strategy_pause_anchor`）中按适配度排序生成的回退瀑布流。
 
 2. **分支 A：阶段一已自然完整 (`needs_stage2 == false` 且 `audit_passed == true`)**：
    - 直接进入 **Step 5** 落盘。

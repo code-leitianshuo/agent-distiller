@@ -111,32 +111,121 @@ STRATEGY_WATERFALL_BY_PROFILE: Dict[str, List[str]] = {
     "DIRECT_COMPLETE": [],
     "TOOL_SILENT_NATIVE": [
         "strategy_star",
+        "strategy_pot",
         "strategy_prefill",
         "strategy_mpcot",
-        "strategy_pot",
+        "strategy_pause_anchor",
+        "strategy_socratic",
         "strategy_cotevo",
+        "strategy_prm_rerank",
     ],
     "CLI_SYMBOLIC_EXECUTION": [
         "strategy_pot",
         "strategy_star",
         "strategy_mpcot",
+        "strategy_code_paradigm",
         "strategy_cotevo",
+        "strategy_prm_rerank",
         "strategy_prefill",
     ],
     "MULTI_HOP_TOOL_CHAIN": [
         "strategy_mpcot",
+        "strategy_pause_anchor",
+        "strategy_mcts",
         "strategy_star",
         "strategy_cotevo",
         "strategy_pot",
+        "strategy_socratic",
         "strategy_prefill",
     ],
     "STRICT_GUARDED_MINIMAL": [
-        "strategy_star",
-        "strategy_cotevo",
         "strategy_mpcot",
+        "strategy_star",
+        "strategy_mcts",
+        "strategy_cotevo",
         "strategy_pot",
+        "strategy_tia",
+        "strategy_code_paradigm",
+        "strategy_socratic",
+        "strategy_debate",
+        "strategy_prm_rerank",
         "strategy_prefill",
     ],
+}
+
+STRATEGY_WATERFALL_BY_GUARD_LEVEL: Dict[str, List[str]] = {
+    "L0_UNRESTRICTED": [],
+    "L1_SUMMARY_FOLDED": [
+        "strategy_tia",
+        "strategy_star",
+        "strategy_mpcot",
+        "strategy_cotevo",
+        "strategy_prm_rerank",
+        "strategy_prefill",
+    ],
+    "L2_TOOL_SILENT": [
+        "strategy_star",
+        "strategy_pot",
+        "strategy_prefill",
+        "strategy_mpcot",
+        "strategy_pause_anchor",
+        "strategy_socratic",
+        "strategy_cotevo",
+    ],
+    "L3_ENCRYPTED_STATE": [
+        "strategy_mpcot",
+        "strategy_star",
+        "strategy_mcts",
+        "strategy_cotevo",
+        "strategy_pot",
+        "strategy_tia",
+        "strategy_pause_anchor",
+        "strategy_prefill",
+    ],
+    "L4_STRICT_ANTI_DISTILL": [
+        "strategy_code_paradigm",
+        "strategy_socratic",
+        "strategy_debate",
+        "strategy_prm_rerank",
+        "strategy_pot",
+        "strategy_star",
+        "strategy_cotevo",
+    ],
+}
+
+POST_TRAINING_RECIPES: Dict[str, Dict[str, Any]] = {
+    "whitebox": {
+        "access_tier": "whitebox (Open-Source Weights & Internal Activations)",
+        "recommended_methods": [
+            "Coconut (Chain of Continuous Thought curriculum erasure)",
+            "CODI (Self-distillation continuous compression)",
+            "SIM-CoT (Step-level decoder-supervised implicit CoT)",
+            "KaVa (Compressed KV-Cache working-memory distillation)",
+            "PCCoT (Parallel Jacobi iteration continuous CoT)",
+            "OPLD & Sparse Crosscoder (On-policy latent manifold & feature subspace alignment)",
+            "EqR / FPRM (Recurrent-depth fixed-point equilibrium distillation)",
+            "SoftCoT / SofT-GRPO (Vocabulary convex-combination soft tokens + hybrid RL)",
+        ],
+        "workflow": "Step 1: Use the distilled ShareGPT .jsonl from this skill for explicit anchor SFT; Step 2: Apply Coconut/CODI/KaVa/SoftCoT latent compression during student post-training.",
+    },
+    "greybox": {
+        "access_tier": "greybox (Logits / Speculative Verification Oracle Access)",
+        "recommended_methods": [
+            "Top-K Logits KL Distillation (Forward/Reverse KL on tool & reasoning tokens)",
+            "High-Entropy Node Branching (Multi-path sampling at entropy spikes)",
+            "DoLa (Layer-contrastive decoding amplification)",
+            "OSKD (Online Speculative Knowledge Distillation oracle)",
+            "MARCOS / GFlowNets (Markov variational inference & flow-matching DAG sampling)",
+        ],
+        "workflow": "Combine the distilled ShareGPT trajectories with token-level Top-K Logits or OSKD speculative verification during student training.",
+    },
+    "blackbox": {
+        "access_tier": "blackbox (Pure Text & Tool Interface / Closed API)",
+        "recommended_methods": [
+            "Stage 1 Zero-Wrapper Natural Execution + Stage 2 12-Operator Adaptive Waterfall (STaR, MPCoT, PoT, CoT-Evo, Prefill, TIA, MCTS, Debate, Socratic, Code-Paradigm, PRM-Rerank, Pause-Anchor)",
+        ],
+        "workflow": "Directly train student model via LLaMA-Factory SFT / RFT on the PRM-verified ShareGPT .jsonl dataset.",
+    },
 }
 
 # Match standalone <think>...</think> blocks not enclosed in inline backticks
@@ -503,18 +592,26 @@ def profile_trajectory(
     conversations: List[Dict[str, str]],
     used_tools: List[str],
     target_nodes: List[int],
-) -> Tuple[str, List[str]]:
+    audit_errors: Optional[List[str]] = None,
+    guard_override: str = "auto",
+) -> Tuple[str, str, List[str]]:
     """
-    Intelligently classify the Stage-1 trajectory and model guard/output behavior,
-    returning (profile_type, ordered_recommended_stage2_strategies).
+    Intelligently classify both:
+    1) `guard_level` (L0_UNRESTRICTED, L1_SUMMARY_FOLDED, L2_TOOL_SILENT, L3_ENCRYPTED_STATE, L4_STRICT_ANTI_DISTILL)
+    2) `profile_type` (DIRECT_COMPLETE, TOOL_SILENT_NATIVE, CLI_SYMBOLIC_EXECUTION, MULTI_HOP_TOOL_CHAIN, STRICT_GUARDED_MINIMAL)
+    and return (guard_level, profile_type, ordered_recommended_stage2_strategies).
     """
-    if not target_nodes:
-        return "DIRECT_COMPLETE", []
+    audit_errors = audit_errors or []
+    if not target_nodes and not audit_errors:
+        return "L0_UNRESTRICTED", "DIRECT_COMPLETE", []
 
     gpt_indices = [i for i, m in enumerate(conversations) if m.get("from") == "gpt"]
     native_think_count = sum(1 for i in gpt_indices if i not in target_nodes)
     tool_call_count = sum(1 for m in conversations if m.get("from") == "function_call")
+    has_refusal = any("REFUSAL_DETECTED" in e for e in audit_errors)
+    has_short_think = any("THINK_TOO_SHORT" in e or "PRM_UNGROUNDED" in e for e in audit_errors)
 
+    # Determine profile_type
     if native_think_count == 0:
         profile = "STRICT_GUARDED_MINIMAL"
     elif "run_command" in used_tools:
@@ -524,7 +621,37 @@ def profile_trajectory(
     else:
         profile = "TOOL_SILENT_NATIVE"
 
-    return profile, list(STRATEGY_WATERFALL_BY_PROFILE[profile])
+    # Determine guard_level
+    guard_map = {
+        "L0": "L0_UNRESTRICTED",
+        "L1": "L1_SUMMARY_FOLDED",
+        "L2": "L2_TOOL_SILENT",
+        "L3": "L3_ENCRYPTED_STATE",
+        "L4": "L4_STRICT_ANTI_DISTILL",
+    }
+    if guard_override and guard_override.upper() in guard_map:
+        guard_level = guard_map[guard_override.upper()]
+    elif guard_override in STRATEGY_WATERFALL_BY_GUARD_LEVEL:
+        guard_level = guard_override
+    elif has_refusal:
+        guard_level = "L4_STRICT_ANTI_DISTILL"
+    elif has_short_think:
+        guard_level = "L1_SUMMARY_FOLDED"
+    elif native_think_count == 0:
+        guard_level = "L3_ENCRYPTED_STATE"
+    else:
+        guard_level = "L2_TOOL_SILENT"
+
+    # Merge guard_level waterfall and domain profile waterfall without duplicates
+    combined: List[str] = []
+    # If CLI symbolic task on L2/L3, prioritize strategy_pot right at the front
+    if profile == "CLI_SYMBOLIC_EXECUTION" and guard_level in ("L2_TOOL_SILENT", "L3_ENCRYPTED_STATE"):
+        combined.append("strategy_pot")
+    for s in STRATEGY_WATERFALL_BY_GUARD_LEVEL.get(guard_level, []) + STRATEGY_WATERFALL_BY_PROFILE.get(profile, []):
+        if s not in combined:
+            combined.append(s)
+
+    return guard_level, profile, combined
 
 
 def build_stage2_context(
@@ -593,6 +720,13 @@ def build_auto_stage2_prompt(
         "strategy_pot": "PoT Execution-Evidence Grounded Synthesis (命令/路径/输出执行证据锚定)",
         "strategy_cotevo": "CoT-Evo Candidate Selection & Merge (多视角择优融合)",
         "strategy_prefill": "Context-Prefill Guided Completion (顺承上下文第一视角补全)",
+        "strategy_tia": "TIA Trajectory Inversion from Summary (从简短摘要或结论逆向反演直接决策依据)",
+        "strategy_mcts": "MCTS Multi-Branch Evaluation & Selection (评估候选工具决策动机并选出最优路径)",
+        "strategy_debate": "Multi-Agent Critique & Verification (生成-核验闭环消除参数与逻辑跳步)",
+        "strategy_socratic": "Socratic Sub-Goal Decomposition (子问题->外部工具需求->参数/结论递进拆解)",
+        "strategy_code_paradigm": "Code-Paradigm Pre/Post-Condition Specification (前置状态->工具契约->预期输出规约映射)",
+        "strategy_prm_rerank": "PRM Entity-Grounded Reinforcement (强制嵌入问题核心实体、工具名与关键参数值)",
+        "strategy_pause_anchor": "Pause-Anchor Checkpoint Expansion (在连续多跳工具调用交界处设立状态检查点)",
     }
     title = strategy_titles.get(strategy, strategy)
     compact_nodes = json.dumps(stage2_context, ensure_ascii=False, indent=2)
@@ -642,14 +776,31 @@ def extract_last_assistant_text_from_transcript(transcript_path: Path) -> str:
     raise ValueError(f"No JSON object found in Stage-2 transcript: {transcript_path}")
 
 
+def resolve_access_tier(open_source_arg: str, access_tier_arg: str) -> Tuple[bool, str]:
+    if access_tier_arg and access_tier_arg.lower() in ("whitebox", "greybox", "blackbox"):
+        tier = access_tier_arg.lower()
+        return (tier == "whitebox"), tier
+    if str(open_source_arg).lower() in ("true", "1", "yes"):
+        return True, "whitebox"
+    return False, "blackbox"
+
+
 def cmd_inspect(args: argparse.Namespace) -> int:
     transcript_path = Path(args.transcript).resolve()
     conversations, used_tools, user_turns = parse_transcript(transcript_path)
     audit_passed, audit_errors, target_nodes = audit_conversations(
         conversations, expected_turns=args.expected_turns
     )
-    profile_type, recommended_strategies = profile_trajectory(
-        conversations, used_tools, target_nodes
+    guard_level, profile_type, recommended_strategies = profile_trajectory(
+        conversations,
+        used_tools,
+        target_nodes,
+        audit_errors=audit_errors,
+        guard_override=getattr(args, "guard_level", "auto"),
+    )
+    is_open_source, access_tier = resolve_access_tier(
+        getattr(args, "open_source", "false"),
+        getattr(args, "access_tier", "auto"),
     )
     tools_str = build_tools_json_string(used_tools)
     stage2_ctx = build_stage2_context(conversations, target_nodes)
@@ -657,10 +808,14 @@ def cmd_inspect(args: argparse.Namespace) -> int:
 
     payload = {
         "sample_id": args.sample_id,
+        "is_open_source": is_open_source,
+        "access_tier": access_tier,
+        "guard_level": guard_level,
         "profile_type": profile_type,
         "needs_stage2": len(target_nodes) > 0,
         "target_node_indices": target_nodes,
         "recommended_strategies": recommended_strategies,
+        "post_training_recipe": POST_TRAINING_RECIPES.get(access_tier, POST_TRAINING_RECIPES["blackbox"]),
         "stage2_history": [],
         "audit_passed": audit_passed,
         "audit_errors": audit_errors,
@@ -687,10 +842,14 @@ def cmd_inspect(args: argparse.Namespace) -> int:
         json.dumps(
             {
                 "sample_id": args.sample_id,
+                "is_open_source": is_open_source,
+                "access_tier": access_tier,
+                "guard_level": guard_level,
                 "profile_type": profile_type,
                 "needs_stage2": len(target_nodes) > 0,
                 "target_node_indices": target_nodes,
                 "recommended_strategies": recommended_strategies,
+                "post_training_methods": payload["post_training_recipe"]["recommended_methods"][:3],
                 "audit_passed": audit_passed,
                 "audit_errors": audit_errors,
                 "completed_turns": user_turns,
@@ -899,10 +1058,13 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command")
 
     for cmd_name in ("inspect", "extract"):
-        p_ins = subparsers.add_parser(cmd_name, help="Inspect Stage-1 transcript, profile behavior, and locate missing <think> nodes.")
+        p_ins = subparsers.add_parser(cmd_name, help="Inspect Stage-1 transcript, profile guard level & open-source tier, and locate missing <think> nodes.")
         p_ins.add_argument("--transcript", required=True, help="Path to transcript_full.jsonl or transcript.jsonl.")
         p_ins.add_argument("--sample-id", required=True, help="Sample identifier.")
         p_ins.add_argument("--expected-turns", type=int, default=1, help="Minimum expected human turns.")
+        p_ins.add_argument("--open-source", default="false", help="Whether target model is open-source (true|false).")
+        p_ins.add_argument("--access-tier", default="auto", choices=["auto", "whitebox", "greybox", "blackbox"], help="Model access tier.")
+        p_ins.add_argument("--guard-level", default="auto", help="Override or auto-detect guard level (auto|L0|L1|L2|L3|L4).")
         p_ins.add_argument("--system", default="", help="Optional custom system prompt for ShareGPT output.")
         p_ins.add_argument("--output", required=True, help="Output path for inspected JSON payload.")
 
