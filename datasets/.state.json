@@ -1,6 +1,6 @@
 {
   "created_at": "2026-11-07T11:42:10.618856+00:00",
-  "updated_at": "2026-11-07T12:32:08.040649+00:00",
+  "updated_at": "2026-11-07T14:19:13.993514+00:00",
   "max_retries": 5,
   "samples": {
     "seed_code_audit_01": {
@@ -99,7 +99,177 @@
       "completed_at": "2026-11-07T12:31:30.986038+00:00",
       "output_file": "F:\\zl\\datasets\\sharegpt_train.jsonl",
       "message_count": 7
+    },
+    "domain_algo_01": {
+      "sample_id": "domain_algo_01",
+      "domain": "coding_algorithm",
+      "system": "",
+      "tools": [],
+      "question": "请编写并运行一段 Python 脚本（通过 run_command），实现“带负权边的有向图最短路径与负环检测（Bellman-Ford 算法）”。测试图包含 6 个节点（0~5），边集为：(0,1,5), (0,2,2), (1,3,1), (2,1,-4), (2,4,3), (3,2,2), (3,5,4), (4,5,2)。请先验证该图是否存在负权环（指出构成负环的节点序列），然后将边 (3,2,2) 的权重修改为 3 以消除负环，重新计算节点 0 到所有节点的最短距离与前驱路径。",
+      "follow_ups": [
+        "如果将该图扩展为需要求解任意两点间最短路径（All-Pairs Shortest Paths）的场景，请进一步通过 Python 脚本实现 Johnson 算法（利用虚拟源点 Bellman-Ford 势函数重赋权 + Dijkstra），并在上述修改边 (3,2,3) 后的测试图上验证其输出的 6x6 最短距离矩阵。"
+      ],
+      "target_turns": 2,
+      "status": "completed",
+      "retry_count": 0,
+      "access_tier": "blackbox",
+      "guard_level": "UNPROFILED",
+      "profile_type": "UNPROFILED",
+      "recommended_strategies": [
+        "strategy_star",
+        "strategy_mpcot",
+        "strategy_pot",
+        "strategy_cotevo",
+        "strategy_prefill"
+      ],
+      "tried_strategies": [],
+      "next_strategy": "strategy_star",
+      "last_diagnosis": "",
+      "subagent_history": [
+        "065ca52e-e9a5-492a-9b34-b1c40a048dcf"
+      ],
+      "updated_at": "2026-11-07T13:24:33.530296+00:00",
+      "template_used": "M60_strategy_pot+M24_strategy_tia",
+      "completed_at": "2026-11-07T14:19:13.674262+00:00",
+      "output_file": "F:\\zl\\datasets\\sharegpt_train.jsonl",
+      "message_count": 16
+    },
+    "domain_eng_02": {
+      "sample_id": "domain_eng_02",
+      "domain": "coding_engineering",
+      "system": "",
+      "tools": [],
+      "question": "请检查当前仓库 skills/multi-turn-tool-distiller/scripts/method_registry.py 与 trajectory_extractor.py 的实际代码实现，统计注册表中共收录了多少种蒸馏方法、每个维度（D01~D12）各包含多少种方法，并验证是否存在重复的 id 或 key。",
+      "follow_ups": [
+        "在实际工程调用中，如果用户向 filter_methods 传入了大小写混合的缩写参数（例如 --select-methods \"m03,coconut,STRATEGY_POT\" 且同时传入 --exclude-methods \"strategy_star\"），resolve_method_token 和 filter_methods 会如何处理？请运行命令实际测试并结合源码解释其工程容错逻辑。"
+      ],
+      "target_turns": 2,
+      "status": "completed",
+      "retry_count": 0,
+      "access_tier": "blackbox",
+      "guard_level": "UNPROFILED",
+      "profile_type": "UNPROFILED",
+      "recommended_strategies": [
+        "strategy_star",
+        "strategy_mpcot",
+        "strategy_pot",
+        "strategy_cotevo",
+        "strategy_prefill"
+      ],
+      "tried_strategies": [],
+      "next_strategy": "strategy_star",
+      "last_diagnosis": "",
+      "subagent_history": [
+        "b74a29db-75d9-42fe-b779-2bddc13b7df1"
+      ],
+      "updated_at": "2026-11-07T13:24:33.652112+00:00",
+      "template_used": "M61_strategy_ast_query_plan+M24_strategy_tia",
+      "completed_at": "2026-11-07T14:19:13.891615+00:00",
+      "output_file": "F:\\zl\\datasets\\sharegpt_train.jsonl",
+      "message_count": 22
+    },
+    "domain_3d_spatial_03": {
+      "sample_id": "domain_3d_spatial_03",
+      "domain": "3d_spatial_generation",
+      "system": "",
+      "tools": [],
+      "question": "在 3D 程序化网格生成（Procedural 3D Mesh Generation）中，请通过 Python 脚本（run_command）生成一个中心在原点、外接球半径 R=2.0 的正二十面体（Regular Icosahedron）3D 三角网格，计算并输出其顶点数 V、边数 E、三角面片数 F、欧拉示性数 chi = V - E + F、表面积与有向体积（Signed Volume），并检查每条有向边是否严格成对反向出现以验证其为封闭流形网格（Watertight Manifold）。",
+      "follow_ups": [
+        "现在将该正二十面体绕单位轴 u = (1/sqrt(3), 1/sqrt(3), 1/sqrt(3)) 逆时针旋转 theta = 60 度（使用罗德里格斯旋转公式或四元数），并发射一条从点 O=(0, 0, 5) 沿方向 d=(0, 0, -1) 的射线。请通过 Python 脚本实现 Möller-Trumbore 射线-三角形相交算法，求出射线与旋转后网格的首次交点 3D 坐标、行进距离 t 以及命中面片的单位外法向量。"
+      ],
+      "target_turns": 2,
+      "status": "completed",
+      "retry_count": 0,
+      "access_tier": "blackbox",
+      "guard_level": "UNPROFILED",
+      "profile_type": "UNPROFILED",
+      "recommended_strategies": [
+        "strategy_star",
+        "strategy_mpcot",
+        "strategy_pot",
+        "strategy_cotevo",
+        "strategy_prefill"
+      ],
+      "tried_strategies": [],
+      "next_strategy": "strategy_star",
+      "last_diagnosis": "",
+      "subagent_history": [
+        "b251e7c1-ca3d-4fd6-b5ad-12a973b5dfdd"
+      ],
+      "updated_at": "2026-11-07T13:24:33.775169+00:00",
+      "template_used": "M62_strategy_mpcot+M24_strategy_tia",
+      "completed_at": "2026-11-07T14:19:13.781551+00:00",
+      "output_file": "F:\\zl\\datasets\\sharegpt_train.jsonl",
+      "message_count": 16
+    },
+    "domain_math_04": {
+      "sample_id": "domain_math_04",
+      "domain": "mathematics",
+      "system": "",
+      "tools": [],
+      "question": "考虑三阶实对称矩阵 A = [[4, 1, 1], [1, 4, 1], [1, 1, 4]]。请结合代数推导并通过 Python 脚本（run_command）精确求解矩阵 A 的全部特征值、正交归一化特征向量矩阵 Q，并计算矩阵指数 exp(t*A) 在 t=1 时的闭式解析表达式与数值矩阵（保留 6 位小数）。",
+      "follow_ups": [
+        "进一步考虑由该矩阵构造的离散时间马尔可夫链转移矩阵 P = (1/6)*A，若初始状态分布为 pi_0 = [1, 0, 0]，请推导第 n 步状态分布 pi_n = pi_0 * P^n 的解析通项公式，并通过 Python 脚本计算当 n=5 和 n=20 时 pi_n 与平稳分布的二范数误差。"
+      ],
+      "target_turns": 2,
+      "status": "completed",
+      "retry_count": 0,
+      "access_tier": "blackbox",
+      "guard_level": "UNPROFILED",
+      "profile_type": "UNPROFILED",
+      "recommended_strategies": [
+        "strategy_star",
+        "strategy_mpcot",
+        "strategy_pot",
+        "strategy_cotevo",
+        "strategy_prefill"
+      ],
+      "tried_strategies": [],
+      "next_strategy": "strategy_star",
+      "last_diagnosis": "",
+      "subagent_history": [
+        "9a135a05-acf5-4478-bf4c-3a748c12c843"
+      ],
+      "updated_at": "2026-11-07T13:24:33.907984+00:00",
+      "template_used": "M24_strategy_tia+M08_strategy_step_back",
+      "completed_at": "2026-11-07T14:19:13.570781+00:00",
+      "output_file": "F:\\zl\\datasets\\sharegpt_train.jsonl",
+      "message_count": 10
+    },
+    "domain_physics_05": {
+      "sample_id": "domain_physics_05",
+      "domain": "physics",
+      "system": "",
+      "tools": [],
+      "question": "在经典力学与计算物理中，考虑二维平面内质量 m=1 的质点在中心引力势 V(r) = -mu / r（取 mu = 1.0）下的开普勒轨道运动。设初始位置 r_0 = (1.0, 0.0)，初始速度 v_0 = (0.0, 0.8)。请推导该椭圆轨道的半长轴 a、偏心率 e、近心点距离 r_min、远心点距离 r_max 与理论周期 T，并编写 Python 脚本使用四阶龙格-库塔法（RK4，步长 dt = 0.0005）数值积分一个完整周期 T，检验比机械能 E 与比角动量 L_z 的相对守恒误差。",
+      "follow_ups": [
+        "若在该中心引力场中引入广义相对论效应（或四极矩）对应的短程摄动势，使有效势变为 V_eff(r) = -mu/r - alpha/r^3（取 alpha = 0.005），请通过 Python 脚本（RK4）模拟 5 个近心点周期，通过插值定位每次经过近心点（Periapsis）时的极角并计算每周期平均进动角 Delta_phi（弧度），与一阶摄动理论公式 Delta_phi_theory = 6 * pi * alpha / (mu * a * (1 - e^2)) 进行定量对比。"
+      ],
+      "target_turns": 2,
+      "status": "completed",
+      "retry_count": 0,
+      "access_tier": "blackbox",
+      "guard_level": "UNPROFILED",
+      "profile_type": "UNPROFILED",
+      "recommended_strategies": [
+        "strategy_star",
+        "strategy_mpcot",
+        "strategy_pot",
+        "strategy_cotevo",
+        "strategy_prefill"
+      ],
+      "tried_strategies": [],
+      "next_strategy": "strategy_star",
+      "last_diagnosis": "",
+      "subagent_history": [
+        "3a13ab69-eba0-4c97-9215-1cc3dd291f98"
+      ],
+      "updated_at": "2026-11-07T13:24:34.040014+00:00",
+      "template_used": "M21_strategy_reflexion+M60_strategy_pot+M24_strategy_tia",
+      "completed_at": "2026-11-07T14:19:13.993514+00:00",
+      "output_file": "F:\\zl\\datasets\\sharegpt_train.jsonl",
+      "message_count": 25
     }
   },
-  "input_source": "F:\\zl\\skills\\multi-turn-tool-distiller\\examples\\seed_examples.jsonl"
+  "input_source": "F:\\zl\\skills\\multi-turn-tool-distiller\\examples\\seed_multidomain_test.jsonl"
 }

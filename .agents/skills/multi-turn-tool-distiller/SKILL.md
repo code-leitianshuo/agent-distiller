@@ -14,9 +14,10 @@ description: Automated multi-turn conversation and real tool-calling trajectory 
 1. **Main-Agent（控制器 / 5D 路由器 / PRM 质检器）**：
    - 负责加载队列、调度并发、推进多轮追问、运行 [`trajectory_extractor.py`](file:///f:/zl/skills/multi-turn-tool-distiller/scripts/trajectory_extractor.py) 诊断轨迹画像、从 **66 种方法库** 中自由选择或自动匹配最优策略，并调用 [`sharegpt_writer.py`](file:///f:/zl/skills/multi-turn-tool-distiller/scripts/sharegpt_writer.py) 原子落盘。
    - **严禁代答与严禁硬编码拼接 `<think>`**：所有业务回答与工具调用必须由阶段一 `distill_executor_agent` 产生；所有缺失节点的 `<think>` 必须由阶段二 `distill_rationalizer_agent` 基于真实轨迹生成。
-2. **双阶段解耦与单样本隔离**：
-   - **阶段一 (`distill_executor_agent`)**：原样发送用户问题与追问（零八股包装），执行真实工具调用，采集未受污染的原生动作分布。
-   - **阶段二 (`distill_rationalizer_agent`)**：针对阶段一缺失 `<think>` 的节点，按所选方法合成 **2~3 句简明高层推理摘要（仅陈述通向工具调用或最终结论的最直接步骤）**，并通过 [`check_prm_grounding`](file:///f:/zl/skills/multi-turn-tool-distiller/scripts/trajectory_extractor.py) 步级实体锚定校验。
+2. **双阶段解耦、三源隐推理融合与单样本隔离**：
+   - **来源一：宿主底层会话日志加密思维摘要线索提取（`M66: strategy_local_transcript_inspect`）**：闭源模型的真实底层隐式推理 Token 在服务端加密不落盘，宿主 `transcript_full.jsonl` 中每个 `PLANNER_RESPONSE` 节点的 `thinking` 字段实为厂商返回的**折叠思维摘要（`L1_SUMMARY_FOLDED`）**。[`trajectory_extractor.py`](file:///f:/zl/skills/multi-turn-tool-distiller/scripts/trajectory_extractor.py) 的 [`parse_transcript_with_clues`](file:///f:/zl/skills/multi-turn-tool-distiller/scripts/trajectory_extractor.py#L326-L555) 自动提取该字段并存为 `stage2_context[idx]["folded_thought_summary_clue"]`（绝不将英文第三人称摘要直接生硬拼入 `<think>`），同时支持从 `transcript.jsonl` 自动回填缺失步与过滤异常重试步。
+   - **来源二：阶段一自然决策流 `<think>` 外化捕获 (`distill_executor_agent`)**：原样发送用户问题与追问（零八股包装），执行真实工具调用，捕获正文中的 `<think>`。若阶段一 `<think>` 仅为单句浅层动作宣告（`< 280` 字符，如 `"我将运行脚本..."`）或混入宿主通信脚手架（`send_message` / `父 Agent`），[`check_prm_grounding`](file:///f:/zl/skills/multi-turn-tool-distiller/scripts/trajectory_extractor.py#L583-L654) 将自动识别并移交阶段二重构。
+   - **来源三：阶段二 66 方法靶向逆向内化重构 (`distill_rationalizer_agent`)**：针对需要深化或补全的节点，结合来源一的 `folded_thought_summary_clue`、真实 `function_call` 参数及 `observation` 输出，从 `M01`~`M66`（如 `M24: strategy_tia` 轨迹反演、`M60: strategy_pot` 程序思维、`M03: strategy_star` 逆向归因）合成**第一人称高密度内化推演 `<think>`**（涵盖目标拆解、参数/公式推导、观察结果核验与自省闭环），并通过 [`check_prm_grounding`](file:///f:/zl/skills/multi-turn-tool-distiller/scripts/trajectory_extractor.py#L583-L654) 与 [`audit_conversations`](file:///f:/zl/skills/multi-turn-tool-distiller/scripts/trajectory_extractor.py#L657-L740) 步级实体锚定校验。
    - 每条样本采集并校验完毕后，立即调用 `manage_subagents(Action="kill")` 销毁对应子 Agent 实例。
 
 ---
@@ -213,8 +214,8 @@ python skills/multi-turn-tool-distiller/scripts/trajectory_extractor.py inspect 
 ```powershell
 python skills/multi-turn-tool-distiller/scripts/sharegpt_writer.py commit `
   --extracted "datasets/stage1_<sample_id>.json" `
-  --output-dir "datasets" `
-  --train-file "sharegpt_train.jsonl" `
-  --failed-file "failed.jsonl"
+  --output-file "datasets/sharegpt_train.jsonl" `
+  --state-dir "datasets" `
+  --template-used "<strategy_or_recipe_used>"
 ```
 落盘成功后删除临时文件 `datasets/stage1_<sample_id>.json`。

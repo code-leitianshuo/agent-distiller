@@ -292,6 +292,17 @@ def clean_human_prompt(raw_content: str) -> str:
     return text
 
 
+def clean_native_thinking(raw_thinking: str) -> str:
+    """Clean vendor folded thought summary (`thinking` / `reasoning` field in transcript_full.jsonl, L1_SUMMARY_FOLDED)."""
+    if not raw_thinking:
+        return ""
+    text = re.sub(r"^\s*I'm thinking through how to approach this\.\s*", "", raw_thinking, flags=re.IGNORECASE).strip()
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    if text in ("...", "redacted", "[encrypted]"):
+        return ""
+    return text
+
+
 def split_think_and_body(raw_text: str) -> Tuple[List[str], str]:
     """Extract standalone <think>...</think> blocks and the remaining visible answer text."""
     if not raw_text:
@@ -311,14 +322,14 @@ def split_think_and_body(raw_text: str) -> Tuple[List[str], str]:
     return thinks, body
 
 
-def parse_transcript(
+def parse_transcript_with_clues(
     transcript_path: Path,
-) -> Tuple[List[Dict[str, str]], List[str], int]:
+) -> Tuple[List[Dict[str, str]], List[str], int, Dict[int, str]]:
     """
-    Convert Antigravity transcript JSONL into raw ShareGPT conversations list.
-    Does NOT fabricate any <think> strings: if a tool call or response step lacks
-    <think>, its gpt value leaves the <think> absent so `inspect` marks it for Stage-2
-    model-based rationale synthesis.
+    Convert Antigravity transcript JSONL into raw ShareGPT conversations list plus
+    `folded_summary_clues` (mapping gpt node_index -> vendor L1 thought summary from step['thinking']).
+    Does NOT fabricate any <think> strings or blindly paste third-person English thought summaries
+    into <think>.
     """
     if not transcript_path.exists():
         fallback = transcript_path.parent / "transcript.jsonl"
@@ -327,15 +338,40 @@ def parse_transcript(
         else:
             raise FileNotFoundError(f"Transcript file not found: {transcript_path}")
 
-    steps: List[Dict[str, Any]] = []
+    steps_by_idx: Dict[int, Dict[str, Any]] = {}
+    ordered_Without_idx: List[Dict[str, Any]] = []
     with transcript_path.open("r", encoding="utf-8") as f:
-        for line in f:
+        for pos, line in enumerate(f):
             line = line.strip()
             if line:
-                steps.append(json.loads(line))
+                obj = json.loads(line)
+                s_idx = obj.get("step_index")
+                if isinstance(s_idx, int):
+                    steps_by_idx[s_idx] = obj
+                else:
+                    ordered_Without_idx.append(obj)
+
+    # Backfill any step_index dropped from transcript_full.jsonl using transcript.jsonl if present
+    sibling_compact = transcript_path.parent / "transcript.jsonl"
+    if sibling_compact.exists() and sibling_compact != transcript_path and steps_by_idx:
+        with sibling_compact.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    obj = json.loads(line)
+                    s_idx = obj.get("step_index")
+                    if isinstance(s_idx, int) and s_idx not in steps_by_idx:
+                        steps_by_idx[s_idx] = obj
+
+    steps: List[Dict[str, Any]] = (
+        [steps_by_idx[k] for k in sorted(steps_by_idx.keys())] + ordered_Without_idx
+        if steps_by_idx
+        else ordered_Without_idx
+    )
 
     conversations: List[Dict[str, str]] = []
     used_tools: List[str] = []
+    folded_summary_clues: Dict[int, str] = {}
     user_turns = 0
 
     i = 0
@@ -367,6 +403,7 @@ def parse_transcript(
 
         if stype == "PLANNER_RESPONSE":
             raw_content = str(step.get("content") or "").strip()
+            raw_native = clean_native_thinking(str(step.get("thinking") or step.get("reasoning") or ""))
             thinks, body = split_think_and_body(raw_content)
             tool_calls = step.get("tool_calls") or []
 
@@ -393,6 +430,12 @@ def parse_transcript(
                         except Exception:
                             msg_arg = {"Message": msg_arg}
                     delivered_text = str(msg_arg.get("Message") or raw_content).strip()
+                    # Strip accidental surrounding quotes from truncated/serialized JSON string if present
+                    if delivered_text.startswith('"') and delivered_text.endswith('"'):
+                        try:
+                            delivered_text = json.loads(delivered_text)
+                        except Exception:
+                            pass
                     s_thinks, s_body = split_think_and_body(delivered_text)
                     final_thinks = list(s_thinks or thinks)
                     final_body = s_body or body
@@ -409,6 +452,16 @@ def parse_transcript(
                             final_thinks.extend(t_thinks)
                         j += 1
 
+                    # Skip any subsequent disk-space recovery / duplicate send_message retry steps before the next user turn
+                    while j < n:
+                        peek = steps[j]
+                        if peek.get("type") == "USER_INPUT" or is_parent_agent_message(peek):
+                            break
+                        j += 1
+
+                    node_idx = len(conversations)
+                    if raw_native:
+                        folded_summary_clues[node_idx] = raw_native
                     if final_thinks:
                         conversations.append(
                             {"from": "gpt", "value": f"<think>\n{final_thinks[-1]}\n</think>\n{final_body}"}
@@ -416,6 +469,22 @@ def parse_transcript(
                     else:
                         conversations.append({"from": "gpt", "value": final_body})
 
+                    i = j
+                    continue
+
+                # If the very last tool call in the transcript timed out into an unfinished background task
+                # followed only by an async waiting message, skip the unfinished tool call so Stage-2 can
+                # synthesize the final response from the preceding completed observations.
+                if (
+                    j == n - 1
+                    and len(obs_steps) == 1
+                    and "Tool is running as a background task" in obs_steps[0]
+                    and steps[j].get("type") == "PLANNER_RESPONSE"
+                    and not steps[j].get("tool_calls")
+                ):
+                    node_idx = len(conversations)
+                    if raw_native:
+                        folded_summary_clues[node_idx] = raw_native
                     i = j
                     continue
 
@@ -434,6 +503,10 @@ def parse_transcript(
 
                     if t_name not in used_tools:
                         used_tools.append(t_name)
+
+                    node_idx = len(conversations)
+                    if raw_native:
+                        folded_summary_clues[node_idx] = raw_native
 
                     # Only use genuine model-emitted <think>; otherwise leave empty for Stage-2 model synthesis
                     if idx < len(thinks) and thinks[idx]:
@@ -464,6 +537,9 @@ def parse_transcript(
                     )
 
                 if body:
+                    node_idx = len(conversations)
+                    if raw_native:
+                        folded_summary_clues[node_idx] = raw_native
                     if len(thinks) > len(tool_calls):
                         conversations.append(
                             {"from": "gpt", "value": f"<think>\n{thinks[-1]}\n</think>\n{body}"}
@@ -475,6 +551,9 @@ def parse_transcript(
                 continue
             else:
                 if raw_content:
+                    node_idx = len(conversations)
+                    if raw_native:
+                        folded_summary_clues[node_idx] = raw_native
                     if thinks:
                         conversations.append(
                             {
@@ -489,7 +568,32 @@ def parse_transcript(
 
         i += 1
 
+    return conversations, used_tools, user_turns, folded_summary_clues
+
+
+def parse_transcript(
+    transcript_path: Path,
+) -> Tuple[List[Dict[str, str]], List[str], int]:
+    conversations, used_tools, user_turns, _ = parse_transcript_with_clues(transcript_path)
     return conversations, used_tools, user_turns
+
+
+HOST_SCAFFOLD_LEAK_TERMS = (
+    "send_message",
+    "父 agent",
+    "父agent",
+    "parent agent",
+    "父代理",
+    "后台执行",
+    "等待系统通知",
+    "临时磁盘空间不足",
+    "c 盘空间不足",
+)
+
+SHALLOW_ANNOUNCEMENT_RE = re.compile(
+    r"^\s*(?:我将|脚本已写入|已将|已通过|已完成|现在通过|现在我将).*$",
+    re.DOTALL,
+)
 
 
 def check_prm_grounding(
@@ -499,13 +603,22 @@ def check_prm_grounding(
 ) -> Tuple[bool, Optional[str]]:
     """
     Process Reward Model (PRM) grounding & consistency check:
-    Ensures the <think> text is contextually grounded in the surrounding trajectory
-    (e.g., references the tool, arguments, file/command, or task context) and is not
-    an empty or generic boilerplate string.
+    1) Rejects empty/short (<12 chars) strings;
+    2) Rejects host multi-agent scaffolding leakage (`send_message`, `父 Agent`, etc.);
+    3) Rejects single-sentence superficial action announcements (<85 chars with no derivation);
+    4) Ensures pre-tool <think> is grounded in the tool/arguments/context.
     """
     cleaned = think_text.strip()
     if len(cleaned) < 12:
         return False, f"THINK_TOO_SHORT(step={gpt_idx})"
+
+    low_think = cleaned.lower()
+    for leak_term in HOST_SCAFFOLD_LEAK_TERMS:
+        if leak_term in low_think:
+            return False, f"HOST_SCAFFOLD_LEAK_IN_THINK(step={gpt_idx})"
+
+    if len(cleaned) < 280 and SHALLOW_ANNOUNCEMENT_RE.match(cleaned):
+        return False, f"SHALLOW_ACTION_ANNOUNCEMENT(step={gpt_idx})"
 
     next_msg = conversations[gpt_idx + 1] if gpt_idx + 1 < len(conversations) else None
     if next_msg and next_msg.get("from") == "function_call":
@@ -532,7 +645,6 @@ def check_prm_grounding(
                             candidate_anchors.append(seq[k : k + 2])
                     break
 
-            low_think = cleaned.lower()
             if candidate_anchors and not any(anchor in low_think for anchor in candidate_anchors if anchor):
                 return False, f"PRM_UNGROUNDED_PRE_TOOL_THINK(step={gpt_idx})"
         except Exception:
@@ -582,9 +694,22 @@ def audit_conversations(
                             target_nodes.append(idx)
 
             if next_role != "function_call":
-                if not body.strip():
+                clean_body = body.strip()
+                if not clean_body:
                     errors.append(f"EMPTY_FINAL_ANSWER(step={idx})")
-                low_body = body.lower()
+                    if idx not in target_nodes:
+                        target_nodes.append(idx)
+                elif "<truncated" in clean_body:
+                    errors.append(f"TRUNCATED_FINAL_ANSWER(step={idx})")
+                    if idx not in target_nodes:
+                        target_nodes.append(idx)
+                elif len(clean_body) < 80 and any(
+                    w in clean_body for w in ("请稍候", "等待任务完成后继续", "正在后台执行")
+                ):
+                    errors.append(f"INCOMPLETE_ASYNC_WAIT_ANSWER(step={idx})")
+                    if idx not in target_nodes:
+                        target_nodes.append(idx)
+                low_body = clean_body.lower()
                 if any(kw in low_body for kw in REFUSAL_KEYWORDS):
                     errors.append(f"REFUSAL_DETECTED(step={idx})")
 
@@ -636,7 +761,10 @@ def profile_trajectory(
     native_think_count = sum(1 for i in gpt_indices if i not in target_nodes)
     tool_call_count = sum(1 for m in conversations if m.get("from") == "function_call")
     has_refusal = any("REFUSAL_DETECTED" in e for e in audit_errors)
-    has_short_think = any("THINK_TOO_SHORT" in e or "PRM_UNGROUNDED" in e for e in audit_errors)
+    has_short_think = any(
+        any(tag in e for tag in ("THINK_TOO_SHORT", "PRM_UNGROUNDED", "SHALLOW_ACTION_ANNOUNCEMENT", "HOST_SCAFFOLD_LEAK"))
+        for e in audit_errors
+    )
 
     # Determine profile_type
     if native_think_count == 0:
@@ -684,8 +812,10 @@ def profile_trajectory(
 def build_stage2_context(
     conversations: List[Dict[str, str]],
     target_nodes: List[int],
+    folded_summary_clues: Optional[Dict[int, str]] = None,
 ) -> List[Dict[str, Any]]:
     """Build a compact context view of the trajectory for the Stage-2 rationalizer agent."""
+    folded_summary_clues = folded_summary_clues or {}
     context_items: List[Dict[str, Any]] = []
     for idx, msg in enumerate(conversations):
         role = msg.get("from", "")
@@ -701,6 +831,15 @@ def build_stage2_context(
         if role == "gpt" and idx in target_nodes:
             next_role = conversations[idx + 1].get("from", "") if idx + 1 < len(conversations) else ""
             item["node_type"] = "pre_tool_decision" if next_role == "function_call" else "post_observation_final_answer"
+            if idx in folded_summary_clues:
+                item["folded_thought_summary_clue"] = folded_summary_clues[idx]
+            if next_role != "function_call":
+                _, existing_b = split_think_and_body(val)
+                cb = existing_b.strip()
+                if not cb or "<truncated" in cb or (
+                    len(cb) < 80 and any(w in cb for w in ("请稍候", "等待任务完成后继续", "正在后台执行"))
+                ):
+                    item["needs_body_completion"] = True
         context_items.append(item)
     return context_items
 
@@ -753,12 +892,25 @@ def build_auto_stage2_prompt(
         instruction = "为每个目标节点生成一段自然、简明的高层推理摘要（2~3 句话，直接说明该步的目标、所选工具与参数依据或从观察结果得出最终结论的直接步骤）。"
 
     compact_nodes = json.dumps(stage2_context, ensure_ascii=False, indent=2)
-    keys_template = ",\n".join(f'  "{idx}": "..."' for idx in target_nodes)
+    needs_body_nodes = [
+        item["node_index"] for item in stage2_context if item.get("needs_body_completion")
+    ]
+    template_lines: List[str] = []
+    for idx in target_nodes:
+        if idx in needs_body_nodes:
+            template_lines.append(f'  "{idx}": {{"think": "...", "body": "基于前序 observation 的完整 Markdown 最终回答"}}')
+        else:
+            template_lines.append(f'  "{idx}": "..."')
+    keys_template = ",\n".join(template_lines)
     return (
         f"[Stage-2 Operator: {method_key} — {title}]\n"
         f"核心执行算子指令：{instruction}\n\n"
-        f"请针对待补全节点索引列表 {target_nodes}，基于以下第一阶段真实执行轨迹上下文，"
-        f"为每个目标节点生成一段自然、简明的高层推理摘要（2~3 句话，直接说明该步的目标、所选工具与参数依据或从观察结果得出最终结论的直接步骤）：\n\n"
+        f"硬性约束：\n"
+        f"1. 若节点包含 `folded_thought_summary_clue`（底层加密思考区的第三人称英文折叠摘要线索），请将其与后续真实 `function_call` 参数及 `observation` 输出结合，还原为统一中文、第一人称的高密度 2~3 句推理摘要；\n"
+        f"2. 严禁以“我将…”、“脚本已写入…”、“已完成…”等空洞报幕句式开头，严禁出现 `send_message`、`父 Agent`、`后台执行` 等宿主调度词汇；\n"
+        f"3. 调用工具前节点需写明【问题/公式/状态拆解 + 工具名与关键参数构造依据】；收到 observation 后的总结节点需写明【observation 核心数值/输出核验 + 最终结论收敛】；\n"
+        f"4. 对标记了 `needs_body_completion: true` 的节点 {needs_body_nodes}，请返回 `{{\"think\": \"...\", \"body\": \"完整 Markdown 最终回答\"}}`。\n\n"
+        f"请针对待补全节点索引列表 {target_nodes}，基于以下第一阶段真实执行轨迹上下文生成 JSON 映射：\n\n"
         f"```json\n{compact_nodes}\n```\n\n"
         f"请严格仅输出如下格式的合法 JSON 对象（不要输出额外文字）：\n"
         f"```json\n{{\n{keys_template}\n}}\n```"
@@ -779,6 +931,7 @@ def extract_last_assistant_text_from_transcript(transcript_path: Path) -> str:
         for line in transcript_path.read_text(encoding="utf-8").splitlines()
         if line.strip()
     ]
+    # Pass 1: Prefer complete `send_message` payloads from the Stage-2 subagent
     for step in reversed(steps):
         if step.get("type") != "PLANNER_RESPONSE":
             continue
@@ -792,8 +945,12 @@ def extract_last_assistant_text_from_transcript(transcript_path: Path) -> str:
                     except Exception:
                         args = {"Message": args}
                 msg = str(args.get("Message") or "").strip()
-                if msg:
+                if msg and "{" in msg and "}" in msg:
                     return msg
+    # Pass 2: Fall back to assistant text content
+    for step in reversed(steps):
+        if step.get("type") != "PLANNER_RESPONSE":
+            continue
         content = str(step.get("content") or "").strip()
         if content and "{" in content and "}" in content:
             return content
@@ -837,7 +994,7 @@ def cmd_list_methods(args: argparse.Namespace) -> int:
 
 def cmd_inspect(args: argparse.Namespace) -> int:
     transcript_path = Path(args.transcript).resolve()
-    conversations, used_tools, user_turns = parse_transcript(transcript_path)
+    conversations, used_tools, user_turns, folded_clues = parse_transcript_with_clues(transcript_path)
     audit_passed, audit_errors, target_nodes = audit_conversations(
         conversations, expected_turns=args.expected_turns
     )
@@ -879,7 +1036,7 @@ def cmd_inspect(args: argparse.Namespace) -> int:
     )
 
     tools_str = build_tools_json_string(used_tools)
-    stage2_ctx = build_stage2_context(conversations, target_nodes)
+    stage2_ctx = build_stage2_context(conversations, target_nodes, folded_summary_clues=folded_clues)
     top_strategy = recommended_strategies[0] if recommended_strategies else "strategy_star"
 
     default_recipe = POST_TRAINING_RECIPES.get(
@@ -960,20 +1117,22 @@ def cmd_inspect(args: argparse.Namespace) -> int:
     return 0
 
 
-def parse_stage2_mapping(raw_text: str) -> Dict[str, str]:
-    """Extract JSON object mapping node_index -> rationale from Stage-2 agent output."""
+def parse_stage2_mapping(raw_text: str) -> Dict[str, Any]:
+    """Extract JSON object mapping node_index -> rationale (str or {'think': ..., 'body': ...}) from Stage-2 agent output."""
     text = raw_text.strip()
-    fence_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
-    if fence_match:
-        text = fence_match.group(1).strip()
-    else:
-        brace_match = re.search(r"(\{.*\})", text, re.DOTALL)
-        if brace_match:
-            text = brace_match.group(1).strip()
+    brace_match = re.search(r"(\{.*\})", text, re.DOTALL)
+    if brace_match:
+        text = brace_match.group(1).strip()
     obj = json.loads(text)
     if not isinstance(obj, dict):
         raise ValueError("Stage-2 output must be a JSON object mapping node_index -> think text.")
-    return {str(k): str(v).strip() for k, v in obj.items()}
+    result: Dict[str, Any] = {}
+    for k, v in obj.items():
+        if isinstance(v, dict):
+            result[str(k)] = v
+        else:
+            result[str(k)] = str(v).strip()
+    return result
 
 
 def cmd_merge_stage2(args: argparse.Namespace) -> int:
@@ -992,7 +1151,17 @@ def cmd_merge_stage2(args: argparse.Namespace) -> int:
     conversations: List[Dict[str, str]] = payload["sharegpt_record"]["conversations"]
     updated_indices: List[int] = []
 
-    for k_str, rationale in mapping.items():
+    for k_str, val_entry in mapping.items():
+        if not val_entry:
+            continue
+        new_body_override: Optional[str] = None
+        if isinstance(val_entry, dict):
+            rationale = str(val_entry.get("think") or "").strip()
+            if val_entry.get("body"):
+                new_body_override = str(val_entry.get("body")).strip()
+        else:
+            rationale = str(val_entry).strip()
+
         if not rationale:
             continue
         # Strip accidental outer <think> tags if the rationalizer included them
@@ -1001,11 +1170,12 @@ def cmd_merge_stage2(args: argparse.Namespace) -> int:
         idx = int(k_str)
         if 0 <= idx < len(conversations) and conversations[idx].get("from") == "gpt":
             _, existing_body = split_think_and_body(conversations[idx].get("value", ""))
+            effective_body = new_body_override if new_body_override is not None else existing_body
             next_role = conversations[idx + 1].get("from", "") if idx + 1 < len(conversations) else ""
-            if next_role == "function_call" or not existing_body:
+            if next_role == "function_call" or not effective_body:
                 conversations[idx]["value"] = f"<think>\n{clean_rat}\n</think>\n"
             else:
-                conversations[idx]["value"] = f"<think>\n{clean_rat}\n</think>\n{existing_body}"
+                conversations[idx]["value"] = f"<think>\n{clean_rat}\n</think>\n{effective_body}"
             updated_indices.append(idx)
 
     expected_turns = int(payload.get("expected_turns", 1))
