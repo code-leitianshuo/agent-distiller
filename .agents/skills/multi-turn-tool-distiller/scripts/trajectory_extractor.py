@@ -25,6 +25,15 @@ import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from method_registry import (
+    DIMENSION_METADATA,
+    METHOD_CATALOG,
+    filter_methods,
+    resolve_method_token,
+    select_strategies_and_recipes,
+)
+
 
 BUILTIN_TOOL_SCHEMAS: Dict[str, Dict[str, Any]] = {
     "view_file": {
@@ -111,6 +120,7 @@ STRATEGY_WATERFALL_BY_PROFILE: Dict[str, List[str]] = {
     "DIRECT_COMPLETE": [],
     "TOOL_SILENT_NATIVE": [
         "strategy_star",
+        "strategy_echocot_scratchpad",
         "strategy_pot",
         "strategy_prefill",
         "strategy_mpcot",
@@ -121,17 +131,24 @@ STRATEGY_WATERFALL_BY_PROFILE: Dict[str, List[str]] = {
     ],
     "CLI_SYMBOLIC_EXECUTION": [
         "strategy_pot",
+        "strategy_ast_query_plan",
+        "strategy_echocot_scratchpad",
         "strategy_star",
         "strategy_mpcot",
         "strategy_code_paradigm",
+        "strategy_reflexion",
         "strategy_cotevo",
         "strategy_prm_rerank",
         "strategy_prefill",
     ],
     "MULTI_HOP_TOOL_CHAIN": [
+        "strategy_echocot_scratchpad",
         "strategy_mpcot",
+        "strategy_plan_and_solve",
         "strategy_pause_anchor",
         "strategy_mcts",
+        "strategy_got",
+        "strategy_state_continuity",
         "strategy_star",
         "strategy_cotevo",
         "strategy_pot",
@@ -141,6 +158,7 @@ STRATEGY_WATERFALL_BY_PROFILE: Dict[str, List[str]] = {
     "STRICT_GUARDED_MINIMAL": [
         "strategy_mpcot",
         "strategy_star",
+        "strategy_echocot_scratchpad",
         "strategy_mcts",
         "strategy_cotevo",
         "strategy_pot",
@@ -157,28 +175,35 @@ STRATEGY_WATERFALL_BY_GUARD_LEVEL: Dict[str, List[str]] = {
     "L0_UNRESTRICTED": [],
     "L1_SUMMARY_FOLDED": [
         "strategy_tia",
+        "strategy_pause_anchor",
+        "strategy_step_back",
         "strategy_star",
         "strategy_mpcot",
+        "strategy_dlcot",
         "strategy_cotevo",
         "strategy_prm_rerank",
         "strategy_prefill",
     ],
     "L2_TOOL_SILENT": [
         "strategy_star",
+        "strategy_echocot_scratchpad",
         "strategy_pot",
         "strategy_prefill",
         "strategy_mpcot",
         "strategy_pause_anchor",
+        "strategy_plan_and_solve",
         "strategy_socratic",
         "strategy_cotevo",
     ],
     "L3_ENCRYPTED_STATE": [
         "strategy_mpcot",
         "strategy_star",
+        "strategy_echocot_scratchpad",
         "strategy_mcts",
         "strategy_cotevo",
         "strategy_pot",
         "strategy_tia",
+        "strategy_state_continuity",
         "strategy_pause_anchor",
         "strategy_prefill",
     ],
@@ -186,6 +211,8 @@ STRATEGY_WATERFALL_BY_GUARD_LEVEL: Dict[str, List[str]] = {
         "strategy_code_paradigm",
         "strategy_socratic",
         "strategy_debate",
+        "strategy_ast_query_plan",
+        "strategy_echocot_scratchpad",
         "strategy_prm_rerank",
         "strategy_pot",
         "strategy_star",
@@ -711,28 +738,25 @@ def build_auto_stage2_prompt(
     target_nodes: List[int],
     strategy: str = "strategy_star",
 ) -> str:
-    """Automatically build a compact, token-efficient Stage-2 prompt for distill_rationalizer_agent."""
+    """Automatically build a compact, token-efficient Stage-2 prompt for distill_rationalizer_agent using any of the 66 methods."""
     if not target_nodes:
         return ""
-    strategy_titles = {
-        "strategy_star": "STaR Post-hoc Rationalization (已知动作与真实 Observation 逆向归因)",
-        "strategy_mpcot": "MPCoT Multi-Perspective Orthogonal Decomposition (意图/状态/工具正交分解合成)",
-        "strategy_pot": "PoT Execution-Evidence Grounded Synthesis (命令/路径/输出执行证据锚定)",
-        "strategy_cotevo": "CoT-Evo Candidate Selection & Merge (多视角择优融合)",
-        "strategy_prefill": "Context-Prefill Guided Completion (顺承上下文第一视角补全)",
-        "strategy_tia": "TIA Trajectory Inversion from Summary (从简短摘要或结论逆向反演直接决策依据)",
-        "strategy_mcts": "MCTS Multi-Branch Evaluation & Selection (评估候选工具决策动机并选出最优路径)",
-        "strategy_debate": "Multi-Agent Critique & Verification (生成-核验闭环消除参数与逻辑跳步)",
-        "strategy_socratic": "Socratic Sub-Goal Decomposition (子问题->外部工具需求->参数/结论递进拆解)",
-        "strategy_code_paradigm": "Code-Paradigm Pre/Post-Condition Specification (前置状态->工具契约->预期输出规约映射)",
-        "strategy_prm_rerank": "PRM Entity-Grounded Reinforcement (强制嵌入问题核心实体、工具名与关键参数值)",
-        "strategy_pause_anchor": "Pause-Anchor Checkpoint Expansion (在连续多跳工具调用交界处设立状态检查点)",
-    }
-    title = strategy_titles.get(strategy, strategy)
+    method_meta = resolve_method_token(strategy)
+    if method_meta:
+        method_id = method_meta["id"]
+        method_key = method_meta["key"]
+        title = f"{method_id} {method_meta['name_zh']} ({method_meta['name_en']})"
+        instruction = method_meta["stage2_instruction"]
+    else:
+        method_key = strategy
+        title = strategy
+        instruction = "为每个目标节点生成一段自然、简明的高层推理摘要（2~3 句话，直接说明该步的目标、所选工具与参数依据或从观察结果得出最终结论的直接步骤）。"
+
     compact_nodes = json.dumps(stage2_context, ensure_ascii=False, indent=2)
     keys_template = ",\n".join(f'  "{idx}": "..."' for idx in target_nodes)
     return (
-        f"[Stage-2 Operator: {strategy} — {title}]\n"
+        f"[Stage-2 Operator: {method_key} — {title}]\n"
+        f"核心执行算子指令：{instruction}\n\n"
         f"请针对待补全节点索引列表 {target_nodes}，基于以下第一阶段真实执行轨迹上下文，"
         f"为每个目标节点生成一段自然、简明的高层推理摘要（2~3 句话，直接说明该步的目标、所选工具与参数依据或从观察结果得出最终结论的直接步骤）：\n\n"
         f"```json\n{compact_nodes}\n```\n\n"
@@ -777,12 +801,38 @@ def extract_last_assistant_text_from_transcript(transcript_path: Path) -> str:
 
 
 def resolve_access_tier(open_source_arg: str, access_tier_arg: str) -> Tuple[bool, str]:
-    if access_tier_arg and access_tier_arg.lower() in ("whitebox", "greybox", "blackbox"):
+    if access_tier_arg and access_tier_arg.lower() in ("whitebox", "greybox", "blackbox", "hybrid"):
         tier = access_tier_arg.lower()
-        return (tier == "whitebox"), tier
+        return (tier in ("whitebox", "hybrid")), tier
     if str(open_source_arg).lower() in ("true", "1", "yes"):
         return True, "whitebox"
     return False, "blackbox"
+
+
+def cmd_list_methods(args: argparse.Namespace) -> int:
+    matched = filter_methods(
+        dimension=getattr(args, "dimension", "all"),
+        access_tier=getattr(args, "access_tier", "all"),
+        guard_level=getattr(args, "guard_level", "all"),
+        task_domain=getattr(args, "task_domain", "all"),
+        latency_budget=getattr(args, "latency_budget", "all"),
+        search_query=getattr(args, "search", ""),
+        select_methods=getattr(args, "select_methods", ""),
+        exclude_methods=getattr(args, "exclude_methods", ""),
+    )
+    print(
+        json.dumps(
+            {
+                "total_catalog_methods": len(METHOD_CATALOG),
+                "dimensions": DIMENSION_METADATA,
+                "matched_count": len(matched),
+                "methods": matched,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+    return 0
 
 
 def cmd_inspect(args: argparse.Namespace) -> int:
@@ -791,7 +841,7 @@ def cmd_inspect(args: argparse.Namespace) -> int:
     audit_passed, audit_errors, target_nodes = audit_conversations(
         conversations, expected_turns=args.expected_turns
     )
-    guard_level, profile_type, recommended_strategies = profile_trajectory(
+    guard_level, profile_type, base_strategies = profile_trajectory(
         conversations,
         used_tools,
         target_nodes,
@@ -802,9 +852,40 @@ def cmd_inspect(args: argparse.Namespace) -> int:
         getattr(args, "open_source", "false"),
         getattr(args, "access_tier", "auto"),
     )
+
+    task_domain = getattr(args, "task_domain", "auto")
+    if task_domain == "auto":
+        if "run_command" in used_tools:
+            task_domain = "code_symbolic"
+        elif len(used_tools) >= 1:
+            task_domain = "tool_agent"
+        else:
+            task_domain = "general"
+
+    latency_budget = getattr(args, "latency_budget", "auto")
+    dimension_filter = getattr(args, "dimension", "all")
+    select_methods_arg = getattr(args, "select_methods", "")
+    exclude_methods_arg = getattr(args, "exclude_methods", "")
+
+    recommended_strategies, selected_method_cards, custom_post_recipes = select_strategies_and_recipes(
+        base_stage2_waterfall=base_strategies,
+        access_tier=access_tier,
+        guard_level=guard_level,
+        task_domain=task_domain,
+        latency_budget=latency_budget,
+        dimension=dimension_filter,
+        select_methods=select_methods_arg,
+        exclude_methods=exclude_methods_arg,
+    )
+
     tools_str = build_tools_json_string(used_tools)
     stage2_ctx = build_stage2_context(conversations, target_nodes)
     top_strategy = recommended_strategies[0] if recommended_strategies else "strategy_star"
+
+    default_recipe = POST_TRAINING_RECIPES.get(
+        "whitebox" if access_tier == "hybrid" else access_tier,
+        POST_TRAINING_RECIPES["blackbox"],
+    )
 
     payload = {
         "sample_id": args.sample_id,
@@ -812,10 +893,17 @@ def cmd_inspect(args: argparse.Namespace) -> int:
         "access_tier": access_tier,
         "guard_level": guard_level,
         "profile_type": profile_type,
+        "task_domain": task_domain,
+        "latency_budget": latency_budget,
+        "dimension_filter": dimension_filter,
+        "select_methods": select_methods_arg,
+        "exclude_methods": exclude_methods_arg,
         "needs_stage2": len(target_nodes) > 0,
         "target_node_indices": target_nodes,
         "recommended_strategies": recommended_strategies,
-        "post_training_recipe": POST_TRAINING_RECIPES.get(access_tier, POST_TRAINING_RECIPES["blackbox"]),
+        "selected_method_cards": selected_method_cards[:6],
+        "post_training_recipe": default_recipe,
+        "detailed_post_training_methods": custom_post_recipes[:8],
         "stage2_history": [],
         "audit_passed": audit_passed,
         "audit_errors": audit_errors,
@@ -846,10 +934,18 @@ def cmd_inspect(args: argparse.Namespace) -> int:
                 "access_tier": access_tier,
                 "guard_level": guard_level,
                 "profile_type": profile_type,
+                "task_domain": task_domain,
                 "needs_stage2": len(target_nodes) > 0,
                 "target_node_indices": target_nodes,
                 "recommended_strategies": recommended_strategies,
-                "post_training_methods": payload["post_training_recipe"]["recommended_methods"][:3],
+                "top_selected_methods": [
+                    f"{c['id']}:{c['key']} ({c['name_zh']})" for c in selected_method_cards[:5]
+                ],
+                "post_training_methods": (
+                    [f"{m['id']}:{m['key']} ({m['name_zh']})" for m in custom_post_recipes[:5]]
+                    if custom_post_recipes
+                    else payload["post_training_recipe"]["recommended_methods"][:3]
+                ),
                 "audit_passed": audit_passed,
                 "audit_errors": audit_errors,
                 "completed_turns": user_turns,
@@ -1058,15 +1154,30 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command")
 
     for cmd_name in ("inspect", "extract"):
-        p_ins = subparsers.add_parser(cmd_name, help="Inspect Stage-1 transcript, profile guard level & open-source tier, and locate missing <think> nodes.")
+        p_ins = subparsers.add_parser(cmd_name, help="Inspect Stage-1 transcript, profile guard level & open-source tier, and select from 66 methods.")
         p_ins.add_argument("--transcript", required=True, help="Path to transcript_full.jsonl or transcript.jsonl.")
         p_ins.add_argument("--sample-id", required=True, help="Sample identifier.")
         p_ins.add_argument("--expected-turns", type=int, default=1, help="Minimum expected human turns.")
         p_ins.add_argument("--open-source", default="false", help="Whether target model is open-source (true|false).")
-        p_ins.add_argument("--access-tier", default="auto", choices=["auto", "whitebox", "greybox", "blackbox"], help="Model access tier.")
+        p_ins.add_argument("--access-tier", default="auto", choices=["auto", "whitebox", "greybox", "blackbox", "hybrid"], help="Model access tier.")
         p_ins.add_argument("--guard-level", default="auto", help="Override or auto-detect guard level (auto|L0|L1|L2|L3|L4).")
+        p_ins.add_argument("--task-domain", default="auto", choices=["auto", "general", "tool_agent", "code_symbolic", "math_logic", "long_context", "multimodal"], help="Fine-grained task domain filter.")
+        p_ins.add_argument("--latency-budget", default="auto", choices=["auto", "unconstrained", "moderate", "low_latency", "ultra_fast"], help="Target student inference latency budget.")
+        p_ins.add_argument("--dimension", default="all", help="Filter methods by dimension(s), e.g., D01,D02,D10 or all.")
+        p_ins.add_argument("--select-methods", default="", help="Freely select specific method IDs (M01..M66) or keys in custom order (comma-separated).")
+        p_ins.add_argument("--exclude-methods", default="", help="Exclude specific method IDs (M01..M66) or keys (comma-separated).")
         p_ins.add_argument("--system", default="", help="Optional custom system prompt for ShareGPT output.")
         p_ins.add_argument("--output", required=True, help="Output path for inspected JSON payload.")
+
+    p_list = subparsers.add_parser("list-methods", help="Browse, search, and filter all 66 implicit reasoning distillation methods (with when_to_use & how_to_use).")
+    p_list.add_argument("--dimension", default="all", help="Filter by dimension (D01..D12, comma-separated).")
+    p_list.add_argument("--access-tier", default="all", help="Filter by access tier (blackbox|greybox|whitebox|all).")
+    p_list.add_argument("--guard-level", default="all", help="Filter by guard level (L0|L1|L2|L3|L4|all).")
+    p_list.add_argument("--task-domain", default="all", help="Filter by domain (general|tool_agent|code_symbolic|math_logic|long_context|multimodal|all).")
+    p_list.add_argument("--latency-budget", default="all", help="Filter by latency budget (unconstrained|moderate|low_latency|ultra_fast|all).")
+    p_list.add_argument("--search", default="", help="Keyword search in method names and instructions.")
+    p_list.add_argument("--select-methods", default="", help="Query specific method IDs (M01..M66) or keys.")
+    p_list.add_argument("--exclude-methods", default="", help="Exclude specific method IDs or keys.")
 
     p_merge = subparsers.add_parser("merge-stage2", help="Merge Stage-2 model-generated rationales and run PRM verification.")
     p_merge.add_argument("--inspected", required=True, help="Path to inspected JSON payload.")
@@ -1089,6 +1200,8 @@ def main() -> int:
         return run_self_test()
     if args.command in ("inspect", "extract"):
         return cmd_inspect(args)
+    if args.command == "list-methods":
+        return cmd_list_methods(args)
     if args.command == "merge-stage2":
         return cmd_merge_stage2(args)
     parser.print_help()

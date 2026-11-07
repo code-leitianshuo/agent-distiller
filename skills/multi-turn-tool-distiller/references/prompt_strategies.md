@@ -1,81 +1,101 @@
-# Two-Stage Adaptive Distillation Operators (`prompt_strategies.md`)
+# 双阶段蒸馏提示词算子与后训练执行规范 (`prompt_strategies.md`)
 
-本文件与 [method_taxonomy.md](./method_taxonomy.md) 配套使用，定义：
-1. **阶段一执行子代理 (`distill_executor_agent`) 的轻量级自然引导系统提示词**；
-2. **Main-Agent 智能三维路由矩阵（开源属性 `access_tier` × 防护等级 `guard_level` `L0`~`L4` × 任务领域 `domain`）**；
-3. **阶段二重构子代理 (`distill_rationalizer_agent`) 的 12 大可执行重构算子库**；
-4. **面向开源白盒 (`whitebox`) 与灰盒 (`greybox`) 模型的后训练对齐配方生成器**。
+本文件定义 `multi-turn-tool-distiller` 的 **阶段一零包装自然执行策略**、**阶段二可执行重构算子库（覆盖 `M01`~`M24`、`M26`、`M49`、`M57`~`M62`、`M65`~`M66`）** 以及 **灰盒/白盒后训练配置生成规范（覆盖 `M25`、`M27`~`M48`、`M50`~`M56`、`M63`~`M64`）**。
 
 ---
 
-## 1. 阶段一：轻量级自然执行系统提示词 (`distill_executor_agent`)
+## 一、核心原则（杜绝人为八股文与分布失真）
 
-```markdown
-You are a capable technical assistant solving multi-turn tasks with real workspace and MCP tools.
-Follow these natural reasoning guidelines on every turn:
-1. Always include a concise `<think>...</think>` block (a high-level summary in 2-3 sentences covering only the direct steps leading to your tool call or final answer) at the start of every response text.
-2. When invoking a tool (`run_command`, `view_file`, `read_file`, etc.), if you emit message text alongside the tool call, start it with `<think>...</think>` briefly stating why that tool and its arguments are needed.
-3. On Windows PowerShell, use `;` rather than `&&` to chain commands.
-4. Address only the user's current turn request accurately and wait for the user's next message.
+1. **阶段一（自然分布采集，`distill_executor_agent`）**：
+   - 用户提问与多轮追问 **原样发送**，严禁在 User 消息外包裹任何诱导八股或格式指令。
+   - 仅在 Sub-Agent 的 `SystemPrompt` 中提供极简自然引导，允许模型在 `<think>...</think>` 中输出 **简明的高层推理摘要（2~3 句话，仅陈述通向工具调用或最终回答的最直接步骤）**。
+2. **阶段二（锚定逆向重演，`distill_rationalizer_agent`）**：
+   - 当阶段一因模型防护（`L1`~`L4`）或原生工具调用静默导致缺失 `<think>` 时，Main-Agent 根据 **用户自由指定的 `--select-methods`** 或 **五维自动路由器** 选择算子，基于已知真实轨迹 $(X, A, O, Y)$ 合成高层推理摘要。
+   - **禁止使用 Python 硬编码字符串模板拼接 `<think>`**：所有缺失节点的 `<think>` 必须由独立的 `distill_rationalizer_agent` 实例生成，并通过 `check_prm_grounding` 锚定校验。
+
+---
+
+## 二、阶段一（Stage 1）Sub-Agent 定义规范
+
+```json
+{
+  "Name": "distill_executor_agent",
+  "Description": "Stage-1 natural execution teacher subagent with real workspace and MCP tools.",
+  "EnableWriteTools": true,
+  "EnableMCPTools": true,
+  "EnableSubagentTools": false,
+  "SystemPrompt": "You are a helpful AI assistant with access to workspace and MCP tools. Before calling a tool or providing your final answer, briefly summarize your high-level reasoning inside <think>...</think> tags (2-3 concise sentences covering the direct steps leading to the action or conclusion). When you finish each turn and are ready to reply to the user, send your complete turn response back to the parent agent ID specified in the task prompt using send_message."
+}
 ```
 
 ---
 
-## 2. Main-Agent 智能三维判定与算子路由表
+## 三、阶段二（Stage 2）Sub-Agent 定义规范
 
-`trajectory_extractor.py inspect` 会根据用户指定的 `--open-source <true|false>`、`--access-tier <whitebox|greybox|blackbox>`、`--guard-level <auto|L0|L1|L2|L3|L4>` 以及阶段一实际输出特征，自动计算：
-- **`guard_level`**（防护等级：`L0_UNRESTRICTED`、`L1_SUMMARY_FOLDED`、`L2_TOOL_SILENT`、`L3_ENCRYPTED_STATE`、`L4_STRICT_ANTI_DISTILL`）
-- **`profile_type`**（轨迹特征：`DIRECT_COMPLETE`、`TOOL_SILENT_NATIVE`、`CLI_SYMBOLIC_EXECUTION`、`MULTI_HOP_TOOL_CHAIN`、`STRICT_GUARDED_MINIMAL`）
-- **`recommended_strategies`**（从 12 个二阶段算子中按优先级定制的回退序列）
-- **`post_training_recipe`**（当 `--open-source true` 或 `--access-tier whitebox/greybox` 时，自动生成对应的 Coconut / CODI / KaVa / SoftCoT / OSKD 训练超参建议）
+```json
+{
+  "Name": "distill_rationalizer_agent",
+  "Description": "Stage-2 trajectory rationalization subagent supporting all 66 distillation methods.",
+  "EnableWriteTools": false,
+  "EnableMCPTools": false,
+  "EnableSubagentTools": false,
+  "SystemPrompt": "You are a Reasoning Trajectory Rationalization Engine. Given a completed multi-turn tool-calling trajectory (user questions, exact tool calls, real tool observations, and final answers), synthesize concise, high-level <think>...</think> summaries for the specified target node indices using the requested distillation method. Every summary must be 2-3 sentences covering only the most direct logical steps and grounding exact tool names, parameters, and observation facts. Return ONLY a valid JSON object mapping each target node index (as a string key) to its synthesized thought text."
+}
+```
 
-| 防护等级 (`guard_level`) | 典型特征 | 自动匹配的 Stage-2 算子瀑布流 (`recommended_strategies`) |
+---
+
+## 四、阶段二可执行黑盒/代理算子指令矩阵（怎么用 & 注入指令）
+
+当 `trajectory_extractor.py inspect` 生成 `stage2_prompt` 时，会根据所选方法（`M01`~`M66`）自动注入对应的算子执行指令：
+
+| 方法编号与策略键 | 适用条件（什么时候用） | 注入 `distill_rationalizer_agent` 的核心算子指令（怎么用） |
 | :--- | :--- | :--- |
-| **`L0_UNRESTRICTED`** | 阶段一所有节点已输出合规 `<think>` 且通过 PRM 校验 | `[]`（直接通过） |
-| **`L1_SUMMARY_FOLDED`** | `<think>` 被折叠为极简短语（`< 25` 字符）或缺少工具参数映射 | `strategy_tia` -> `strategy_star` -> `strategy_mpcot` -> `strategy_cotevo` -> `strategy_prefill` |
-| **`L2_TOOL_SILENT`** | 正文含 `<think>`，但原生 `tool_call` 步骤静默无内联文本 | `strategy_star` -> `strategy_pot` -> `strategy_prefill` -> `strategy_mpcot` -> `strategy_pause_anchor` |
-| **`L3_ENCRYPTED_STATE`** | 阶段一全程 `native_think_count == 0`（隐推理加密屏蔽），仅输出工具调用与答案 | `strategy_mpcot` -> `strategy_star` -> `strategy_mcts` -> `strategy_cotevo` -> `strategy_pot` -> `strategy_tia` |
-| **`L4_STRICT_ANTI_DISTILL`** | 触发强反蒸馏排斥或常规重构算子连续未通过 PRM 校验 | `strategy_code_paradigm` -> `strategy_socratic` -> `strategy_debate` -> `strategy_prm_rerank` -> `strategy_pot` -> `strategy_star` |
+| **`M01` `strategy_meta_prompt`**<br>结构化元提示拆解 | `L0`~`L2` 常规缺失思考节点，需按标准认知结构补全 | 按“①当前子目标识别 → ②所需工具或前置条件核对 → ③直接执行动作/结论推导”三段式结构，为每个目标节点生成 2~3 句高层摘要。 |
+| **`M02` `strategy_prefill`**<br>回复预填充引导 | 模型默认跳过思考直出结论，需通过上下文首句顺承引导 | 为每个目标节点先构造贴合上下文的起始引导前缀（如“针对用户提出的…，需先通过…工具获取…”），并自然续写完成剩余 1~2 句直接推理。 |
+| **`M03` `strategy_star`**<br>已知动作逆向归因 (STaR) | 阶段一已拿到真实 `function_call` 与 `observation`，逆向补全推理桥 | 将后续已知的真实工具调用参数或最终回答视为确定性目标，逆向推导从当前输入状态到达该动作的最直接逻辑桥梁。 |
+| **`M04` `strategy_quiet_star`**<br>词元级隐式前瞻合理化 | 多轮跨步工具链，需解释当前动作对后续轮次的铺垫价值 | 结合后续步骤的真实环境反馈，从前瞻视角说明当前工具调用或回复如何为完成整条任务链路提供必要支撑。 |
+| **`M05` `strategy_debate`**<br>多智能体对抗质询与修正 | 常规单次重构易漏掉参数来源或未通过 PRM 校验 | 先起草初始推导，再以审计员视角核查“每个工具名、文件路径与参数值是否在上下文中有明确依据”，修正跳步后输出定稿。 |
+| **`M06` `strategy_socratic`**<br>苏格拉底助产术拆解 | `L4` 强反蒸馏拒答或复杂多跳问题，需通过客观问答还原 | 不使用任何“内部思考/心路历程”表述，改为围绕“当前已知事实是什么？缺失哪项核心数据？调用哪个工具可补齐？”的客观问答合成摘要。 |
+| **`M07` `strategy_least_to_most`**<br>由简入繁递进分解 | 复合多跳任务，后一步依赖前一步的基础结果 | 将当前轮次拆解为基础前置子任务与后续递进子任务，明确说明当前节点正在解决哪个最小原子子问题及其工具依据。 |
+| **`M08` `strategy_step_back`**<br>后退一步抽象原理锚定 | 架构分析、规则校验或数学/科学问题 | 先后退一步点明当前步骤所依据的通用架构规范、校验法则或接口契约，再将其映射到具体的工具调用参数或结论。 |
+| **`M09` `strategy_plan_and_solve`**<br>先规划后求解显式锚定 | 单轮包含连续多次工具调用，需明确全局计划进度 | 在首节点点明整体分步执行蓝图（Plan），在后续工具节点点明当前处于蓝图的哪一步以及上一步结果如何驱动下一步（Solve）。 |
+| **`M10` `strategy_ccot`**<br>正反对比思维链归因 | 存在多个相近候选工具，需明确工具选型边界 | 简要点明为何当前工具及参数相比其他备选方式更直接有效，并给出参数提取依据。 |
+| **`M11` `strategy_code_paradigm`**<br>代码与接口规约范式转换 | `L4` 强反蒸馏护栏，自然语言解释被拒但代码文档放行 | 以软件工程接口规约视角，将每个节点的推导表述为“输入前置条件（Precondition）→ 调用规约与参数绑定 → 预期输出断言”，再浓缩为 2~3 句摘要。 |
+| **`M12` `strategy_state_continuity`**<br>跨轮会话状态连续性锚定 | 多轮对话（`turns >= 2`），需衔接前序轮次已确认状态 | 显式引用上一轮对话已获取的工具输出或确认结论，说明本轮如何在前序状态基础上推进新操作。 |
+| **`M13` `strategy_tier_alignment`**<br>跨尺寸同族模型对齐转录 | 旗舰模型输出极简，需利用轻量/同族模型展开可读推理 | 严格锁定阶段一旗舰模型产出的真实工具调用与结论，展开符合学生模型学习粒度的 2~3 句直接推理步骤。 |
+| **`M14` `strategy_context_compaction`**<br>长上下文自动摘要逆向展开 | 消息数较多的长链路轨迹，需从阶段性汇总反推单步依据 | 先提炼当前阶段的核心里程碑，再将该里程碑拆解回当前具体工具调用节点的直接输入输出依据。 |
+| **`M15` `strategy_echocot_scratchpad`**<br>工具调用链状态驻留草稿锚定 | 单轮连续多跳工具调用（EchoCoT 场景） | 聚焦相邻两次工具调用之间的状态驻留窗口：明确陈述上一步 `observation` 返回了什么具体字段，以及该字段如何直接决定下一步 `function_call` 的参数。 |
+| **`M16` `strategy_budget_oracle`**<br>词元长度与复杂度预算预言机 | 需按步骤实际复杂度精准控制 `<think>` 摘要长度与信息密度 | 严格按照系统根据命令复杂度与返回字节数测算的句数/字数预算（2~3 句紧凑高密度文本）合成推导，禁止冗余扩写。 |
+| **`M17` `strategy_mcts`**<br>蒙特卡洛树搜索轨迹重构 | 多步探索任务，需按终端成功结果回传节点价值 | 从整条轨迹最终成功的终端状态回溯，说明当前节点的工具选择为何是通向最终答案的高价值路径。 |
+| **`M18` `strategy_tot`**<br>思维树分叉评估展开 | 关键决策点存在多条可行分解路径 | 针对当前节点内部比选可行方案，保留与实际执行的 `function_call` 参数完全吻合的最优直接路径。 |
+| **`M19` `strategy_got`**<br>思维图有向聚合重构 | 并行或先后调用多个工具后汇总结论 | 将多个前置工具返回的 `observation` 视为有向图入边，清晰陈述如何聚合多源证据得出当前结论。 |
+| **`M20` `strategy_bot`**<br>思维缓冲区元模板检索 | 同领域批量任务（代码审计/VCS/Schema 校验） | 调用当前领域的标准高层推理元结构（目标定位 → 工具参数映射 → 结果验证），填入本样本的真实实体与参数。 |
+| **`M21` `strategy_reflexion`**<br>环境反馈语言强化自省 | 轨迹中出现非零退出码、异常输出或参数调整 | 锚定前一步 `observation` 中的报错或边界提示，直接说明如何据此修正当前步的工具命令或参数。 |
+| **`M22` `strategy_self_consistency`**<br>多路自洽性投票与共识提纯 | 高可靠性要求，需提取多视角共识事实 | 仅保留在多角度审视下均100%成立的确定性工具参数依据与观察事实，剔除一切推测性表述。 |
+| **`M23` `strategy_prm_rerank`**<br>过程奖励模型步级过滤重排 | PRM 校验未通过或需最大化实体锚定率 | 强制确保每一句推导均显式包含后续 `function_call` 的工具名、核心参数值（如路径、命令标志）或前置 `observation` 的关键指标。 |
+| **`M24` `strategy_tia`**<br>推理轨迹反演展开网络 (TIA) | `L1` 思考被折叠为一句话笼统摘要 | 以已有的简短摘要或最终结论为终点，逆向反演展开出支撑该摘要成立的 2~3 句具体执行步骤。 |
+| **`M26` `strategy_entropy_branch`**<br>高熵决策节点分叉采样 | 多工具竞争的高不确定度节点 | 针对多工具或多参数分支点，直接阐明选择当前工具及参数的确切上下文依据。 |
+| **`M49` `strategy_pause_anchor`**<br>暂停与填充词元算力锚定 | 复杂工具决策前需显式设置结构化检查点 | 按“[目标检查点] → [参数映射检查点] → [执行决策点]”三锚点紧凑串联为 2~3 句高层推理摘要。 |
+| **`M57` `strategy_cotevo`**<br>多教师思维链遗传交叉变异 | 融合目标意图与符号执行双视角并剪除冗余 | 融合“用户任务目标拆解”与“工具参数符号推导”两条主线，剪除一切套话，保留高信息密度摘要。 |
+| **`M58` `strategy_merge_of_thought`**<br>多源异构思维链共识合并 | 合并多条候选推导各自命中的关键实体 | 将来自问题上下文、工具契约与观察反馈的三方关键实体无缝嫁接为连贯的 2~3 句推导。 |
+| **`M59` `strategy_dlcot`**<br>去冗余长思维链结构剪枝 | 原始 `<think>` 过长或含无效兜圈，需提纯为精炼摘要 | 剪除一切重复寒暄、无效回溯与事后总结词，仅保留通向工具调用或最终答案的最直接步骤。 |
+| **`M60` `strategy_pot`**<br>可执行程序思维锚定 (PoT) | 含 `run_command`、脚本执行、Git 命令或数值计算 | 严格锚定将要执行的命令语法、参数标志及前一步标准输出（stdout/exit code）数据进行符号级推导。 |
+| **`M61` `strategy_ast_query_plan`**<br>抽象语法树与查询计划蒸馏 | 含 AST 代码解析、JSON Schema 校验或结构化查询 | 从抽象语法结构、字段校验规则或数据结构映射角度，直接说明工具调用的目标节点与验证逻辑。 |
+| **`M62` `strategy_mpcot`**<br>多视角正交分解 (MPCoT) | 同时涉及用户意图、环境状态与工具契约的复杂多轮任务 | 依次从【用户意图视角】、【当前环境状态视角】与【工具接口参数视角】三个正交维度合成 2~3 句紧凑推导。 |
+| **`M65` `strategy_timing_chunk_budget`**<br>流式延迟与载荷复杂度校准 | 根据步骤耗时与 `observation` 载荷大小动态适配详略度 | 针对大载荷/多参数关键步完整写明输入输出依据（2~3 句），针对轻量确认步保持 1~2 句精炼直接推导。 |
+| **`M66` `strategy_local_transcript_inspect`**<br>宿主本地会话日志无损对齐 | 从本地 `transcript_full.jsonl` 合并原生外显思考与补全缺失节点 | 保留本地日志中已合规的原生外显 `<think>`，仅针对缺失节点精准补全与上下文无缝衔接的高层摘要。 |
 
 ---
 
-## 3. 阶段二：12 大可执行推演重构算子库 (`distill_rationalizer_agent`)
+## 五、灰盒与白盒方法（`M25`、`M27`~`M48`、`M50`~`M56`、`M63`~`M64`）的后训练配置输出规范
 
-以下 12 个算子均已内置于 `trajectory_extractor.py` 的 `build_auto_stage2_prompt` 引擎中，支持通过 `--strategy <name>` 自动生成对应算子的定制 Prompt：
+当用户指定 `--open-source true`、`--access-tier greybox|whitebox` 或在 `--select-methods` 中选择了灰盒/白盒方法（如 `M25`, `M34`, `M35`, `M39`, `M42`, `M47`, `M50` 等）时：
 
-1. **`strategy_star`（STaR 已知答案与真实 Observation 逆向归因）**
-   - 给定实际调用的 `function_call`、真实 `observation` 与最终答复，逆向合成连接上下文与动作/结论的高层直接逻辑桥。
-2. **`strategy_mpcot`（MPCoT 多视角正交分解合成）**
-   - 从“用户任务意图”、“当前环境已知/未知状态”、“工具契约与参数映射”三个正交维度提取要点并融合为简明推理摘要。
-3. **`strategy_pot`（PoT 程序与执行证据符号锚定）**
-   - 严格以轨迹中的实际命令字符串、文件路径、退出码及标准输出中的关键数值为锚点生成推理摘要，消除自由文本幻觉。
-4. **`strategy_cotevo`（CoT-Evo 多候选演化择优融合）**
-   - 综合多个候选视角的推理表达，剪除冗余套话，保留实体锚定最紧密的高信噪比推理摘要。
-5. **`strategy_prefill`（Prefill 决策上下文前缀续写补全）**
-   - 站在助手执行到该步时的第一视角，顺承上一条消息内容自然续写导向工具调用或最终答复的思考摘要。
-6. **`strategy_tia`（TIA 摘要与结论反演展开 — 针对 `L1_SUMMARY_FOLDED`）**
-   - 针对被折叠或过度简略的摘要，结合工具实际输入输出反演还原出完整的直接决策依据。
-7. **`strategy_mcts`（MCTS 关键决策节点多路径评估择优 — 针对 `L3_ENCRYPTED_STATE`）**
-   - 针对复杂多步工具链，在内部评估候选工具调用动机的合理性后输出与后续真实执行路径 100% 契合的最优推理分支。
-8. **`strategy_debate`（Multi-Agent 生成-质询-修正闭环 — 针对 `L4_STRICT_ANTI_DISTILL`）**
-   - 结合“生成者提出推理依据 -> 核验者对照真实工具参数与输出挑刺 -> 输出无幻觉最终摘要”的内生修正机制。
-9. **`strategy_socratic`（Socratic 结构化子目标分解 — 针对复杂多轮追问）**
-   - 通过“当前子问题是什么 -> 需要什么外部工具数据支撑 -> 如何转化为具体参数/回答”的递进问答结构生成清晰摘要。
-10. **`strategy_code_paradigm`（Code-Paradigm 接口规约映射 — 针对 `L4_STRICT_ANTI_DISTILL`）**
-    - 利用模型对工程规约的高遵循度，将每个节点的推理任务表述为编写“前置状态条件（Pre-condition）-> 工具调用契约（Action Contract）-> 预期输出（Post-condition）”的自然语言工程注释摘要。
-11. **`strategy_prm_rerank`（PRM 实体锚定强化重构 — 针对 PRM 校验未过回退）**
-    - 强制显式嵌入当前轮次 `human` 提问的核心关键词、所调用的 `tool_name` 及关键参数值，确保 100% 通过 PRM 过程锚定检验。
-12. **`strategy_pause_anchor`（Pause-Anchor 算力检查点显式展开 — 针对多跳工具链）**
-    - 在连续多次工具调用的交界处设立状态检查点，简明概括“上一步工具已确认的事实 + 当前剩余缺口 + 下一步工具动作”。
-
----
-
-## 4. 开源白盒 (`whitebox`) 与灰盒 (`greybox`) 后训练对接规范
-
-当目标模型为开源模型（`--open-source true` / `--access-tier whitebox`）或开放概率接口的灰盒模型（`--access-tier greybox`）时，`trajectory_extractor.py inspect` 除了生成标准 ShareGPT `.jsonl` 显式轨迹外，还会在状态报告中输出推荐的后训练内化配方（`post_training_recipe`）：
-
-- **开源白盒模式 (`whitebox`)**：
-  - **阶段 A（显式思维链对齐 SFT）**：使用本插件产出的纯净 ShareGPT `.jsonl` 进行基础工具调用与 `<think>` 锚点微调；
-  - **阶段 B（连续隐空间压缩 / 循环深度内化）**：根据模型架构自动匹配 **Coconut**（课程式擦除 `<think>` 词元转为连续隐状态）、**CODI**（显隐双路径自蒸馏）、**KaVa**（压缩 KV-Cache 蒸馏）、**OPLD**（在策隐流形对齐）、**EqR**（循环深度不动点蒸馏）或 **SoftCoT**（词表凸组合软词元传递）。
-- **半开源 / 灰盒模式 (`greybox`)**：
-  - 结合本插件产出的高信噪比轨迹，在训练端启用 **Top-K Logits KL 散度损失**、**DoLa 跨层对比解码** 或 **OSKD 在线投机解码验证预言机**。
+1. **第一层交付物（显式锚点数据集）**：
+   先完成阶段一与阶段二，在 `datasets/sharegpt_train.jsonl` 中产出 100% 经过 PRM 锚定校验的标准 ShareGPT 轨迹（为白盒课程擦除、步级解码器 `SIM-CoT` 或不动点对齐提供精确的步骤级监督锚点）。
+2. **第二层交付物（可执行后训练配方 `post_training_recipes`）**：
+   `trajectory_extractor.py inspect` 与 `recommend` 会在输出 JSON 中自动生成所选灰盒/白盒方法的结构化训练规范，包含：
+   - `method_id` 与 `name`（如 `M34: Coconut — Chain of Continuous Thought`）
+   - `when_to_use`（适用条件）
+   - `how_to_use`（基于 `sharegpt_train.jsonl` 的具体训练步骤、损失函数公式与关键超参数配置）
